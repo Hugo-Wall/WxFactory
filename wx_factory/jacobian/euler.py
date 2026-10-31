@@ -54,6 +54,14 @@ def _compile_action(action, component):
     )
 
 
+def _aligned_compiled_input(value):
+    """Share one aligned CUDA input across compiled actions in inference mode."""
+    # Inductor otherwise copies misaligned inputs separately for each action.
+    if value.is_cuda and torch.is_inference_mode_enabled() and value.data_ptr() % 16:
+        return value.clone()
+    return value
+
+
 @cache
 def _compiled_acoustic_action():
     return _compile_action(AcousticLinearization._apply, "interface")
@@ -278,7 +286,7 @@ class EulerLinearization:
 
     def __call__(self, vector, *, explicit=False):
         rhs, fields, base_state = self.rhs, self.rhs.metric.volume, self.state
-        delta_state = vector.reshape(base_state.shape).to(base_state.dtype)
+        delta_state = _aligned_compiled_input(vector.reshape(base_state.shape).to(base_state.dtype))
         compile_volume = delta_state.is_cuda
         prepare_volume, scalar_flux, add_vorticity = _prepare_volume, _scalar_flux, _add_vorticity
         if compile_volume:

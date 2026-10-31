@@ -8,6 +8,31 @@ from wx_factory.solvers.pmex import PmexStartup, pmex
 
 
 class KiopsPmexToleranceCpuTestCases(WxTestCase):
+    def test_pmex_output_times_and_task1_match_dense_reference(self):
+        context = Context(self.comm, "cpu")
+        diagonal = torch.tensor([-1.0, -2.0], dtype=torch.float64)
+        inputs = torch.tensor([[0.0, 0.0], [1.0, 2.0]], dtype=torch.float64)
+        times = torch.tensor([0.2, 1.0], dtype=torch.float64)
+        for output_times in (times, times.tolist()):
+            for task1 in (False, True):
+                with self.subTest(tensor=isinstance(output_times, torch.Tensor), task1=task1):
+                    actual, _ = pmex(
+                        output_times,
+                        lambda vector: diagonal * vector,
+                        inputs,
+                        1e-12,
+                        m_init=3,
+                        mmin=3,
+                        mmax=3,
+                        task1=task1,
+                        context=context,
+                    )
+                    expected = 1 - torch.exp(times[:, None] * diagonal)
+                    if task1:
+                        expected /= times[:, None]
+                    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(times, torch.tensor([0.2, 1.0], dtype=torch.float64), rtol=0, atol=0)
+
     def test_pmex_rejects_nonfinite_operator_action(self):
         context = Context(self.comm, "cpu")
         inputs = torch.tensor([[0.0, 0.0], [1.0, 2.0]], dtype=torch.float32)

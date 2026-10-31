@@ -61,6 +61,8 @@ def pmex(
         raise ValueError(f"mmax ({mmax}) must be greater than or equal to mmin ({mmin})")
 
     comm = context.comm
+    if isinstance(tau_out, Tensor):
+        tau_out = tau_out.detach().cpu().tolist()
 
     ppo, n = u.shape
     p = ppo - 1
@@ -109,7 +111,7 @@ def pmex(
     context.synchronize()
     comm.Allreduce([local_nrmU, mpi_real], [global_normU, mpi_real])
 
-    normU = torch.amax(global_normU)
+    normU = float(torch.amax(global_normU))
 
     if ppo > 1 and normU > 0:
         ex = math.ceil(math.log2(normU))
@@ -224,7 +226,7 @@ def pmex(
         H[0, j] = 1.0
 
         # Save h_j+1,j and remove it temporarily to compute the exponential of H
-        nrm = H[j, j - 1].clone()
+        nrm = float(H[j, j - 1])
         H[j, j - 1] = 0.0
 
         F_half = expm(sgn * 0.5 * tau * H[0 : j + 1, 0 : j + 1])
@@ -244,6 +246,8 @@ def pmex(
         else:
             err_half = abs(beta * nrm * F_half[j - 1, j])
             err = abs(beta * nrm * F[j - 1, j])
+            # Read both estimates once for the host-side controller.
+            err_half, err = torch.stack((err_half, err)).detach().cpu().tolist()
             if not (math.isfinite(err) and math.isfinite(err_half)):
                 raise FloatingPointError("PMEX matrix exponential produced a non-finite error estimate")
 

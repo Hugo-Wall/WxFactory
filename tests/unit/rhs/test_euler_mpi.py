@@ -61,6 +61,11 @@ class EulerRhsTestCase(MpiTestCase):
         vector = torch.zeros_like(self.state)
         vector[0], vector[4] = 0.01 * self.state[0] * profile, 0.01 * self.state[4] * profile
         vector[1:4] = self.metric.covariant_winds(0.2 * profile, -0.1 * profile, 0.05 * profile)
+        if vector.is_cuda:
+            storage = torch.empty(vector.numel() + 1, dtype=vector.dtype, device=vector.device)
+            shifted = storage[1:].view_as(vector)
+            shifted.copy_(vector)
+            vector = shifted
         _compiled_acoustic_action.cache_clear()
         _compiled_volume_actions.cache_clear()
         _compiled_dfr_derivative.cache_clear()

@@ -4,11 +4,49 @@ from unittest.mock import patch
 import torch
 
 from tests.unit.rhs.euler_frozen_fixture import frozen_problem
-from wx_factory.jacobian.euler import AcousticLinearization, _apply_dfr_derivative, _compiled_dfr_derivative
+from wx_factory.jacobian.euler import (
+    AcousticLinearization,
+    _aligned_compiled_input,
+    _apply_dfr_derivative,
+    _compiled_dfr_derivative,
+)
 from wx_factory.pde.euler_interfaces import EulerInterfaceGeometry, acoustic_interface
 
 
 class EulerJacobianTestCase(unittest.TestCase):
+    def test_input_alignment_preserves_cpu_and_differentiable_inputs(self):
+        devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
+        with torch.inference_mode(False), torch.enable_grad():
+            for device in devices:
+                with self.subTest(device=device):
+                    value = torch.arange(8, dtype=torch.float64, device=device, requires_grad=True)
+                    self.assertIs(_aligned_compiled_input(value), value)
+                    direction = torch.ones_like(value)
+                    _, tangent = torch.func.jvp(_aligned_compiled_input, (value,), (direction,))
+                    torch.testing.assert_close(tangent, direction, rtol=0, atol=0)
+                    _aligned_compiled_input(value).sum().backward()
+                    torch.testing.assert_close(value.grad, direction, rtol=0, atol=0)
+        with torch.inference_mode():
+            value = torch.arange(8, device="cpu")
+            self.assertIs(_aligned_compiled_input(value), value)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_input_alignment_preserves_values_and_ownership(self):
+        with torch.inference_mode():
+            for dtype in (torch.float32, torch.float64):
+                for offset in range(4):
+                    with self.subTest(dtype=dtype, offset=offset):
+                        storage = torch.arange(65, dtype=dtype, device="cuda")
+                        value = storage[offset : offset + 48]
+                        result = _aligned_compiled_input(value)
+                        self.assertEqual(result.data_ptr() % 16, 0)
+                        torch.testing.assert_close(result, value, rtol=0, atol=0)
+                        if value.data_ptr() % 16:
+                            result[0] = -1
+                            self.assertEqual(value[0].item(), offset)
+                        else:
+                            self.assertIs(result, value)
+
     def test_cpu_actions_do_not_load_compiler(self):
         rhs, state, *_ = frozen_problem(elements=2, nodes=2)
         with (
