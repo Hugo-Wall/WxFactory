@@ -1,4 +1,5 @@
 import unittest
+from copy import copy
 from unittest.mock import patch
 
 import torch
@@ -10,6 +11,7 @@ from wx_factory.jacobian.block_solve import blocks_matvec, cyclic_block_solve
 from wx_factory.jacobian.euler_vertical import EulerVerticalLinearization
 from wx_factory.pde.euler_interfaces import pressure
 from wx_factory.rhs.euler_partition import EulerRhsPartition
+from wx_factory.rhs.rhs_euler import RhsEuler
 
 
 class EulerPartitionTestCase(unittest.TestCase):
@@ -19,8 +21,12 @@ class EulerPartitionTestCase(unittest.TestCase):
                 rhs, state, delta = self.problem()
                 rhs.periodic_vertical = periodic
                 reference = rhs(state)
-                rhs.scalar_indices = [0, 4, 5, 6]
-                rhs.log_scalar_indices = [0, 4, 5]
+                config = copy(rhs.config)
+                config.case_number = 410
+                tracer_rhs = RhsEuler(rhs.geom, rhs.ops, rhs.metric, rhs.ptopo, config)
+                tracer_rhs.periodic_vertical = periodic
+                tracer_rhs.damping = rhs.damping
+                rhs = tracer_rhs
                 profile = torch.linspace(0, 1, state[0].numel(), dtype=state.dtype).reshape_as(state[0])
                 state = torch.cat((state, torch.stack((state[4], state[0] * profile * 1e-6))))
                 delta = torch.cat((delta, torch.stack((delta[4], state[0] * (0.2 - profile) * 1e-6))))

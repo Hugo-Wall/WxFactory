@@ -1,4 +1,5 @@
 import unittest
+from copy import copy
 
 import torch
 
@@ -10,6 +11,31 @@ from tests.unit.rhs.euler_frozen_fixture import (
 
 
 class EulerOperatorTestCase(unittest.TestCase):
+    def test_cached_indices_match_list_indexing_for_five_and_seven_variables(self):
+        for case in (0, 410):
+            with self.subTest(case=case):
+                rhs, state, *_ = frozen_problem(elements=2, nodes=3)
+                config = copy(rhs.config)
+                config.case_number = case
+                rhs = type(rhs)(rhs.geom, rhs.ops, rhs.metric, rhs.ptopo, config)
+                if case == 410:
+                    state = torch.cat((state, torch.stack((state[4], 0.01 * state[0]))))
+                self.assertIsInstance(rhs.scalar_indices, list)
+                self.assertIsInstance(rhs.log_scalar_indices, list)
+                self.assertEqual(rhs.scalar_index.tolist(), rhs.scalar_indices)
+                self.assertEqual(rhs.log_scalar_index.tolist(), rhs.log_scalar_indices)
+                self.assertEqual(rhs.scalar_index.dtype, torch.long)
+                self.assertEqual(rhs.scalar_index.device, state.device)
+                reference = copy(rhs)
+                reference.scalar_index = rhs.scalar_indices
+                reference.log_scalar_index = rhs.log_scalar_indices
+                torch.testing.assert_close(rhs(state), reference(state), rtol=0, atol=0)
+                action = rhs.linearize(state)
+                self.assertTrue(all(face.scalar_index is rhs.scalar_index for face in action.interfaces))
+                torch.testing.assert_close(
+                    action(0.01 * state), reference.linearize(state)(0.01 * state), rtol=0, atol=0
+                )
+
     def test_two_scalar_fluxes_preserve_constant_potential_temperature_transport(self):
         rhs, state, positions, _, _, _ = frozen_problem(elements=3)
         profile = torch.sin(positions / 3000).repeat(1, 16).reshape_as(state[0])

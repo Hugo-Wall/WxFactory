@@ -140,8 +140,13 @@ def _add_vorticity(
 class AcousticLinearization:
     """Cache an acoustic face state and apply its linearized interface solver."""
 
-    def __init__(self, left, right, geometry, direction, *, mach_cutoff=0.3, scalar_indices=None):
+    def __init__(self, left, right, geometry, direction, *, mach_cutoff=0.3, scalar_indices=None, scalar_index=None):
         self.scalar_indices = [0, 4] if scalar_indices is None else scalar_indices
+        self.scalar_index = (
+            torch.tensor(self.scalar_indices, dtype=torch.long, device=left.device)
+            if scalar_index is None
+            else scalar_index
+        )
         self.direction = direction
         self.inverse_spatial = geometry.inverse_spatial
         self.normal_scale = geometry.normal_scale
@@ -177,7 +182,7 @@ class AcousticLinearization:
         )
         self.normal_velocity = normal_velocity
         self.upwind = normal_velocity >= 0
-        self.upwind_scalars = torch.where(self.upwind[None], left[self.scalar_indices], right[self.scalar_indices])
+        self.upwind_scalars = torch.where(self.upwind[None], left[self.scalar_index], right[self.scalar_index])
         self.common_contravariant_velocity = spatial_matrix_vector(self.inverse_spatial, self.common_covariant_velocity)
 
     def __call__(self, delta_left, delta_right, *, velocity_only=False):
@@ -218,9 +223,7 @@ class AcousticLinearization:
         ) / 2
         delta_pressure -= delta_pressure_impedance * (self.normal_wind_right - self.normal_wind_left) / 2
         delta_kinetic_energy = (self.common_contravariant_velocity * delta_common_covariant_velocity).sum(dim=0)
-        delta_scalars = torch.where(
-            self.upwind[None], delta_left[self.scalar_indices], delta_right[self.scalar_indices]
-        )
+        delta_scalars = torch.where(self.upwind[None], delta_left[self.scalar_index], delta_right[self.scalar_index])
         delta_normal_velocity = delta_normal * self.normal_scale
         delta_flux = delta_normal_velocity * self.upwind_scalars + self.normal_velocity * delta_scalars
         return delta_normal_velocity, delta_pressure, delta_kinetic_energy, delta_common_covariant_velocity, delta_flux
@@ -233,7 +236,7 @@ class EulerLinearization:
         self.rhs = rhs
         self.shape = state.shape
         self.state = state.reshape((-1,) + rhs.metric.volume.height.shape)
-        self.scalars = self.state[rhs.scalar_indices]
+        self.scalars = self.state[rhs.scalar_index]
         fields = rhs.metric.volume
         self.contravariant_velocity = fields.raise_velocity(self.state[1:4])
         self.pressure = pressure(self.state[4])
@@ -247,6 +250,7 @@ class EulerLinearization:
                 direction,
                 mach_cutoff=rhs.config.riemann_mach_cutoff,
                 scalar_indices=rhs.scalar_indices,
+                scalar_index=rhs.scalar_index,
             )
             for direction, (geometry, face) in enumerate(zip(rhs._static_interfaces(), faces))
         )
@@ -292,13 +296,13 @@ class EulerLinearization:
         if compile_volume:
             prepare_volume, scalar_flux, add_vorticity = _compiled_volume_actions()
             derivative_operators = rhs.dfr_derivatives(_compiled_dfr_derivative())
-        delta_scalars = delta_state[rhs.scalar_indices]
-        relative_scalar_perturbation = delta_state[rhs.log_scalar_indices] / base_state[rhs.log_scalar_indices]
+        delta_scalars = delta_state[rhs.scalar_index]
+        relative_scalar_perturbation = delta_state[rhs.log_scalar_index] / base_state[rhs.log_scalar_index]
         traces = []
         for operator, base_trace in zip(rhs.extrapolations, self.traces):
             trace = torch.empty_like(base_trace)
             trace[1:4] = apply_op(delta_state[1:4], operator)
-            trace[rhs.log_scalar_indices] = base_trace[rhs.log_scalar_indices] * apply_op(
+            trace[rhs.log_scalar_index] = base_trace[rhs.log_scalar_index] * apply_op(
                 relative_scalar_perturbation, operator
             )
             if base_state.shape[0] > 6:
@@ -363,7 +367,7 @@ class EulerLinearization:
             velocity_traces.append(velocity_trace[rhs.mid_faces[direction]])
             faces[direction] = None
             del face, delta_covariant_velocity, velocity_trace
-        result[rhs.scalar_indices] = scalar_tendency
+        result[rhs.scalar_index] = scalar_tendency
         momentum = slice(1, 3 if explicit else 4)
         result[momentum] = -torch.stack(pressure_gradient) / base_state[0] - torch.stack(energy_gradient)
         pressure_acceleration = self.pressure_acceleration[:2] if explicit else self.pressure_acceleration
