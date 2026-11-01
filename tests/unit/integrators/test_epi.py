@@ -9,6 +9,7 @@ import torch
 from mpi4py import MPI
 
 from tests.unit.integrators.test_srerk import LinearRhs, QuadraticRhs, dense_projection
+from tests.unit.rhs.euler_frozen_fixture import frozen_problem
 from wx_factory.context import Context
 from wx_factory.integrators.epi import Epi
 from wx_factory.integrators.epi_stiff import EpiStiff
@@ -170,3 +171,30 @@ class EpiTestCase(unittest.TestCase):
             state, torch.matrix_exp(0.2 * matrix) @ torch.tensor([0.3, 0.7], dtype=state.dtype), atol=2e-9, rtol=2e-9
         )
         self.assertEqual(rhs.linearizations, 0)
+
+    def test_ark_euler_step_matches_dense_phi_action_after_rejection(self):
+        rhs, state, *_ = frozen_problem(elements=1, nodes=2, vertical_elements=2, terrain_slope=0.2, speed=2)
+        generator = torch.Generator().manual_seed(23)
+        state[4] += torch.randn(state[4].shape, generator=generator, dtype=state.dtype)
+        rhs.context = self.context
+        expected = self.method(Epi, 2, rhs).step(state, 0.001)
+        self.config.exponential_solver = "exode"
+        self.config.exode_method = "ARK3(2)4L[2]SA"
+        self.config.exode_controller = "PI3040"
+        self.config.tolerance = 1e-8
+        method = Epi(self.config, 2, rhs, context=self.context)
+        solve = method.solve_exponential
+        results = []
+
+        def record(request):
+            result = solve(request)
+            results.append(result)
+            return result
+
+        with (
+            patch.object(method, "_initial_exode_step", return_value=1.0),
+            patch.object(method, "solve_exponential", side_effect=record),
+        ):
+            actual = method.step(state, 0.001)
+        torch.testing.assert_close(actual, expected, rtol=2e-10, atol=2e-9)
+        self.assertGreater(results[0].rejected_steps, 0)

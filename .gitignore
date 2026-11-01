@@ -9,6 +9,7 @@
 *.so
 
 wx_factory/_version.py
+article/
 
 doc/*.pdf
 doc/aux/*

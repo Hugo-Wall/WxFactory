@@ -42,8 +42,9 @@ def global_dotprod(vec1: Tensor, vec2: Tensor, comm: MPI.Comm = MPI.COMM_WORLD):
 
 def global_inf_norm(vec: NDArray, comm: MPI.Comm = MPI.COMM_WORLD):
     """Compute infinity norm across all PEs in the communicator (default COMM_WORLD)."""
-    local_max = _to_scalar(abs(vec).max())
-    return comm.allreduce(local_max, op=MPI.MAX)
+    norm = numpy.array([_to_scalar(abs(vec).max())], dtype=numpy.float64)
+    comm.Allreduce(MPI.IN_PLACE, norm, op=MPI.MAX)
+    return float(norm[0])
 
 
 def global_allreduce(array: Tensor, context: Context | None = None):

@@ -32,113 +32,120 @@ def _fp64_is_rate_limited(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) in _RATE_LIMITED_FP64
 
 
-def _factor_in_float32(b) -> bool:
+def factor_in_float32(b) -> bool:
     """Select float32 factorization for rate-limited CUDA devices."""
     if b.dtype != torch.float32 or b.device.type != "cuda":
         return False
     return _fp64_is_rate_limited(b.device.index if b.device.index is not None else torch.cuda.current_device())
 
 
-def block_thomas_solve(lower, diag, upper, b, dt):
-    """Solve ``(I - dt/2 J1) x = b`` per column with the block Thomas algorithm.
+class BlockThomasFactor:
+    """Factors of ``I - dt/2 J1`` for repeated right-hand sides.
 
-    Float32 factorization is followed by one refinement step using a float64 residual.
+    Cache D_e^-1, L_e D_(e-1)^-1 and D_e^-1 U_e, where D_e is the Schur complement at element e.
     """
-    half_dt = 0.5 * dt
-    _, num_elem_z, block_size, _ = diag.shape
-    out_dtype = b.dtype
-    refine = _factor_in_float32(b)
-    work_dtype = torch.float32 if refine else torch.float64
-    identity = torch.eye(block_size, dtype=work_dtype).reshape(1, block_size, block_size)
 
-    def diag_block(e):
-        return identity - half_dt * diag[:, e].astype(work_dtype)
+    def __init__(self, lower, diag, upper, dt, *, refine=False, blocks64=None, check_errors=True):
+        """Use blocks64 for refinement when supplied.
 
-    def sub_block(e):
-        return (-half_dt) * lower[:, e].astype(work_dtype)
+        With check_errors=False, the caller must check failures before solving.
+        """
+        self.lower, self.diag, self.upper = lower, diag, upper
+        self.blocks64 = blocks64
+        self.half_dt = 0.5 * dt
+        self.refine = refine
+        self.work_dtype = torch.float32 if refine else torch.float64
+        _, num_elements, block_size, _ = diag.shape
+        identity = torch.eye(block_size, dtype=self.work_dtype, device=diag.device)[None]
+        sub = -self.half_dt * lower.to(self.work_dtype)
+        sup = -self.half_dt * upper.to(self.work_dtype)
+        pivot = identity - self.half_dt * diag[:, 0].to(self.work_dtype)
+        inverse, info = torch.linalg.inv_ex(pivot)
+        failures = info != 0
+        inverses, multipliers = [inverse], []
+        for e in range(1, num_elements):
+            multipliers.append(sub[:, e] @ inverses[-1])
+            pivot = identity - self.half_dt * diag[:, e].to(self.work_dtype) - multipliers[-1] @ sup[:, e - 1]
+            inverse, info = torch.linalg.inv_ex(pivot)
+            failures |= info != 0
+            inverses.append(inverse)
+        self.inverses = torch.stack(inverses, dim=1)
+        self.multipliers = multipliers
+        self.reduced_upper = [inverses[e] @ sup[:, e] for e in range(num_elements - 1)]
+        self.failures = failures.any()
+        # Defer the host synchronization until the block sweep is complete.
+        if check_errors and self.failures.item():
+            raise torch.linalg.LinAlgError("Singular block in vertical column factorization")
 
-    def super_block(e):
-        return (-half_dt) * upper[:, e].astype(work_dtype)
+    def _solve(self, rhs):
+        forward = [rhs[:, 0]]
+        for e, multiplier in enumerate(self.multipliers, start=1):
+            forward.append(torch.baddbmm(rhs[:, e], multiplier, forward[-1], alpha=-1))
+        reduced = self.inverses @ torch.stack(forward, dim=1)
+        result = [None] * reduced.shape[1]
+        result[-1] = reduced[:, -1]
+        for e in range(len(self.reduced_upper) - 1, -1, -1):
+            result[e] = torch.baddbmm(reduced[:, e], self.reduced_upper[e], result[e + 1], alpha=-1)
+        return result
 
-    vector_rhs = b.ndim == 3
-    b = b.astype(work_dtype)
-    if vector_rhs:
-        b = b[..., None]
+    def solve(self, b):
+        vector_rhs = b.ndim == 3
+        right = b.to(self.work_dtype)
+        if vector_rhs:
+            right = right[..., None]
+        result = self._solve(right)
+        if self.refine:
+            lower, diag, upper = self.blocks64 or tuple(block.double() for block in (self.lower, self.diag, self.upper))
+            x = torch.stack(result, dim=1).double()
+            coupled = torch.einsum("ceij,cejk->ceik", diag, x)
+            coupled[:, 1:] += torch.einsum("ceij,cejk->ceik", lower[:, 1:], x[:, :-1])
+            coupled[:, :-1] += torch.einsum("ceij,cejk->ceik", upper[:, :-1], x[:, 1:])
+            residual = (right.double() - x + self.half_dt * coupled).to(self.work_dtype)
+            correction = self._solve(residual)
+            result = [value + delta for value, delta in zip(result, correction)]
+        result = torch.stack(result, dim=1).to(b.dtype)
+        return result[..., 0] if vector_rhs else result
 
-    # Retain the LU factors for back substitution and iterative refinement.
-    factors = [None] * num_elem_z
-    reduced_rhs = [None] * num_elem_z
-    factors[0] = torch.linalg.lu_factor(diag_block(0))
-    reduced_rhs[0] = b[:, 0]
-    for e in range(1, num_elem_z):
-        augmented = torch.concatenate([super_block(e - 1), reduced_rhs[e - 1]], dim=-1)
-        solved = torch.linalg.lu_solve(factors[e - 1][0], factors[e - 1][1], augmented)
-        reduced_upper = solved[..., :block_size]
-        reduced_vec = solved[..., block_size:]
-        factors[e] = torch.linalg.lu_factor(diag_block(e) - sub_block(e) @ reduced_upper)
-        reduced_rhs[e] = b[:, e] - sub_block(e) @ reduced_vec
 
-    def solve_with_factors(rhs):
-        """Solve a new right-hand side with the existing factors."""
-        forward = [None] * num_elem_z
-        forward[0] = rhs[0]
-        for e in range(1, num_elem_z):
-            eliminated = torch.linalg.lu_solve(factors[e - 1][0], factors[e - 1][1], forward[e - 1])
-            forward[e] = rhs[e] - sub_block(e) @ eliminated
-        sol = [None] * num_elem_z
-        top = num_elem_z - 1
-        sol[top] = torch.linalg.lu_solve(factors[top][0], factors[top][1], forward[top])
-        for e in range(num_elem_z - 2, -1, -1):
-            rhs_e = forward[e] - super_block(e) @ sol[e + 1]
-            sol[e] = torch.linalg.lu_solve(factors[e][0], factors[e][1], rhs_e)
-        return sol
+class CyclicBlockFactor:
+    """Block Thomas factors with a Woodbury correction for periodic columns."""
 
-    top = num_elem_z - 1
-    x = [None] * num_elem_z
-    x[top] = torch.linalg.lu_solve(factors[top][0], factors[top][1], reduced_rhs[top])
-    for e in range(num_elem_z - 2, -1, -1):
-        rhs_e = reduced_rhs[e] - super_block(e) @ x[e + 1]
-        x[e] = torch.linalg.lu_solve(factors[e][0], factors[e][1], rhs_e)
+    def __init__(self, lower, diag, upper, dt):
+        lower, diag, upper = (value.double() for value in (lower, diag, upper))
+        self.factor = BlockThomasFactor(lower, diag, upper, dt)
+        num_columns, num_elements, block_size, _ = diag.shape
+        identity = torch.eye(block_size, dtype=diag.dtype, device=diag.device)
+        right = diag.new_zeros((num_columns, num_elements, block_size, 2 * block_size))
+        right[:, 0, :, :block_size] = identity
+        right[:, -1, :, block_size:] = identity
+        self.response = self.factor.solve(right)
+        self.bottom, self.top = -dt / 2 * lower[:, 0], -dt / 2 * upper[:, -1]
+        closure = torch.cat((self.bottom @ self.response[:, -1], self.top @ self.response[:, 0]), dim=1)
+        closure += torch.eye(2 * block_size, dtype=diag.dtype, device=diag.device)
+        lu, pivots, info = torch.linalg.lu_factor_ex(closure, check_errors=False)
+        if (info != 0).any().item():
+            raise torch.linalg.LinAlgError("Singular periodic vertical column correction")
+        self.closure = lu, pivots
 
-    if refine:
-        # Build the float64 residual element by element to limit peak memory.
-        f64 = torch.float64
-        identity64 = torch.eye(block_size, dtype=f64).reshape(1, block_size, block_size)
-        residual = [None] * num_elem_z
-        for e in range(num_elem_z):
-            residual[e] = b[:, e].astype(f64) - ((identity64 - half_dt * diag[:, e].astype(f64)) @ x[e].astype(f64))
-            if e > 0:
-                residual[e] += half_dt * (lower[:, e].astype(f64) @ x[e - 1].astype(f64))
-            if e < num_elem_z - 1:
-                residual[e] += half_dt * (upper[:, e].astype(f64) @ x[e + 1].astype(f64))
-        correction = solve_with_factors([residual[e].astype(work_dtype) for e in range(num_elem_z)])
-        x = [x[e] + correction[e] for e in range(num_elem_z)]
+    def solve(self, b):
+        particular = self.factor.solve(b.double())[..., None]
+        boundary_rhs = torch.cat((self.bottom @ particular[:, -1], self.top @ particular[:, 0]), dim=1)
+        correction = torch.linalg.lu_solve(*self.closure, boundary_rhs)
+        return (particular - self.response @ correction[:, None])[..., 0].to(b.dtype)
 
-    result = torch.stack(x, dim=1).astype(out_dtype)
-    return result[..., 0] if vector_rhs else result
+
+def factor_column_blocks(lower, diag, upper, dt, *, periodic=False, **options):
+    """Factor the column operator in the precision used by the direct solver."""
+    if periodic:
+        return CyclicBlockFactor(lower, diag, upper, dt)
+    return BlockThomasFactor(lower, diag, upper, dt, refine=factor_in_float32(diag), **options)
+
+
+def block_thomas_solve(lower, diag, upper, b, dt):
+    """Solve ``(I - dt/2 J1) x = b`` with one refinement step for float32 CUDA factors."""
+    return BlockThomasFactor(lower, diag, upper, dt, refine=factor_in_float32(b)).solve(b)
 
 
 def cyclic_block_solve(lower, diag, upper, b, dt):
-    """Solve periodic columns using a Woodbury correction to block Thomas.
-
-    The first lower block couples to the last element; the final upper block
-    couples to the first. The correction closes these two boundary block rows.
-    """
-    dtype = b.dtype
-    lower, diag, upper, b = (value.to(torch.float64) for value in (lower, diag, upper, b))
-    num_columns, num_elements, block_size = b.shape
-    identity = torch.eye(block_size, dtype=b.dtype, device=b.device)
-    right = b.new_zeros((num_columns, num_elements, block_size, 1 + 2 * block_size))
-    right[..., 0] = b
-    right[:, 0, :, 1 : 1 + block_size] = identity
-    right[:, -1, :, 1 + block_size :] = identity
-    solved = block_thomas_solve(lower, diag, upper, right, dt)
-    particular, response = solved[..., :1], solved[..., 1:]
-    bottom, top = -dt / 2 * lower[:, 0], -dt / 2 * upper[:, -1]
-
-    # Close both periodic ends through the two boundary block rows.
-    closure = torch.cat((bottom @ response[:, -1], top @ response[:, 0]), dim=1)
-    closure += torch.eye(2 * block_size, dtype=b.dtype, device=b.device)
-    boundary_rhs = torch.cat((bottom @ particular[:, -1], top @ particular[:, 0]), dim=1)
-    correction = torch.linalg.solve(closure, boundary_rhs)
-    return (particular - response @ correction[:, None])[..., 0].to(dtype)
+    """Solve periodic columns using a Woodbury correction to block Thomas."""
+    return CyclicBlockFactor(lower, diag, upper, dt).solve(b)

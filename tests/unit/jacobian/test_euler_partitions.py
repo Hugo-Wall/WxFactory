@@ -7,7 +7,8 @@ import torch
 from tests.unit.rhs.euler_frozen_fixture import frozen_problem
 from wx_factory.common.matmul import apply_op
 from wx_factory.geometry.metric5d import Metric5D
-from wx_factory.jacobian.block_solve import blocks_matvec, cyclic_block_solve
+from wx_factory.jacobian.block_solve import BlockThomasFactor, blocks_matvec, cyclic_block_solve
+from wx_factory.jacobian.column_layout import coupling_variable_rows, stiff_variable_rows
 from wx_factory.jacobian.euler_vertical import EulerVerticalLinearization
 from wx_factory.pde.euler_interfaces import pressure
 from wx_factory.rhs.euler_partition import EulerRhsPartition
@@ -216,6 +217,66 @@ class EulerPartitionTestCase(unittest.TestCase):
             actual = action.solve(delta, 0.1, column_batch_size=7)
             torch.testing.assert_close(delta, original, rtol=0, atol=0)
             torch.testing.assert_close(actual, reference, rtol=2e-12, atol=2e-11)
+
+    def test_reused_column_factors_preserve_stage_equations_after_step_changes(self):
+        for periodic in (False, True):
+            with self.subTest(periodic=periodic):
+                rhs, state, delta = self.problem(nodes=2, vertical_elements=2)
+                rhs.periodic_vertical = periodic
+                reference = rhs.linearize_partitions(state).implicit
+                action = rhs.linearize_partitions(state).column_operator(column_batch_size=3)
+                torch.testing.assert_close(action(delta), reference(delta), rtol=2e-12, atol=2e-10)
+                original = delta.clone()
+                with patch("torch.linalg.inv_ex", wraps=torch.linalg.inv_ex) as factor:
+                    for index, dt in enumerate((0.1, 0.1, 0.025, 0.025, 0.1)):
+                        previous_count = factor.call_count
+                        forcing = (index + 1) * delta
+                        solution = action.solve(forcing, dt)
+                        if index in (1, 3):
+                            self.assertEqual(factor.call_count, previous_count)
+                        else:
+                            self.assertGreater(factor.call_count, previous_count)
+                        residual = solution - dt / 2 * reference(solution).reshape_as(state) - forcing
+                        self.assertLess(residual.abs().max().item(), 2e-10)
+                        torch.testing.assert_close(solution[1:3], forcing[1:3], rtol=0, atol=0)
+                torch.testing.assert_close(delta, original, rtol=0, atol=0)
+
+    def test_column_factors_match_dense_solve_and_detect_singular_blocks(self):
+        devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+        generator = torch.Generator().manual_seed(89)
+        for device in devices:
+            for dtype in (torch.float32, torch.float64):
+                with self.subTest(device=device, dtype=dtype):
+                    blocks = [
+                        (0.1 * torch.randn(2, 3, 3, 3, generator=generator, dtype=dtype)).to(device) for _ in range(3)
+                    ]
+                    matrix = torch.zeros(2, 9, 9, dtype=torch.float64, device=device)
+                    for e in range(3):
+                        row = slice(3 * e, 3 * (e + 1))
+                        matrix[:, row, row] = blocks[1][:, e].double()
+                        if e:
+                            matrix[:, row, 3 * (e - 1) : 3 * e] = blocks[0][:, e].double()
+                        if e < 2:
+                            matrix[:, row, 3 * (e + 1) : 3 * (e + 2)] = blocks[2][:, e].double()
+                    factor = BlockThomasFactor(*blocks, 0.2, refine=device == "cuda" and dtype == torch.float32)
+                    for _ in range(2):
+                        forcing = torch.randn(2, 3, 3, generator=generator, dtype=dtype).to(device)
+                        expected = torch.linalg.solve(
+                            torch.eye(9, dtype=torch.float64, device=device) - 0.1 * matrix,
+                            forcing.double().flatten(1),
+                        )
+                        actual = factor.solve(forcing).flatten(1)
+                        torch.testing.assert_close(actual, expected.to(dtype))
+                    singular = torch.eye(3, dtype=dtype, device=device).expand(2, 3, 3, 3).clone()
+                    zeros = torch.zeros_like(singular)
+                    with self.assertRaises(torch.linalg.LinAlgError):
+                        BlockThomasFactor(zeros, singular, zeros, 2.0)
+
+    def test_stiff_and_coupling_rows_partition_the_column_variables(self):
+        for num_var in (5, 7):
+            with self.subTest(num_var=num_var):
+                rows = torch.cat((stiff_variable_rows(3, "cpu", num_var), coupling_variable_rows(3, "cpu")))
+                torch.testing.assert_close(rows.sort().values, torch.arange(3 * num_var))
 
     def test_frame_gradients_survive_offloading_and_precision_conversion(self):
         rhs, state, _ = self.problem()

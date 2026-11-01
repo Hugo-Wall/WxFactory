@@ -144,11 +144,11 @@ class ExodeTestCase(unittest.TestCase):
             first_step = solver.h_previous
             second_step = solver.h
             solver.step()
-            expected_factor = 0.8**0.5 * (0.3 * 0.2) ** (-1 / 12) * (second_step / first_step) ** (-0.25)
+            expected_factor = 0.8**0.5 * (0.3 * 0.2) ** (-1 / 8) * (second_step / first_step) ** (-0.25)
             self.assertAlmostEqual(solver.h, second_step * limiter(expected_factor, 2))
             trial_step = solver.h
             solver.step()
-        accepted_step = trial_step * limiter(0.8 * 2.0 ** (-1 / 3), 2)
+        accepted_step = trial_step * limiter(0.8 * 2.0 ** (-1 / 2), 2)
         self.assertAlmostEqual(solver.h_previous, accepted_step)
         self.assertLessEqual(solver.h, accepted_step)
         self.assertEqual(solver.failed_steps, 1)
@@ -214,3 +214,131 @@ class ExodeTestCase(unittest.TestCase):
         self.assertEqual(solver.status, "finished")
         self.assertGreater(solver.failed_steps, 0)
         torch.testing.assert_close(solver.y, torch.tensor([math.exp(-2)], dtype=torch.float64), rtol=2e-6, atol=1e-9)
+
+    def test_additive_pairs_match_augmented_matrix_exponential(self):
+        from wx_factory.solvers.exode import OperatorPartition
+
+        explicit = torch.tensor([[-0.3, 1.0, 0.0], [-1.0, -0.2, 0.5], [0.0, -0.5, 0.1]], dtype=torch.float64)
+        implicit = torch.tensor([[-50.0, 0.0, 0.0], [5.0, -2.0, 0.0], [0.0, 0.0, -400.0]], dtype=torch.float64)
+        partition = OperatorPartition(
+            explicit=lambda x: explicit @ x,
+            implicit=lambda x: implicit @ x,
+            solve=lambda r, a: torch.linalg.solve(torch.eye(3, dtype=r.dtype) - a * implicit, r),
+        )
+        vectors = torch.tensor([[0.0, 0.0, 0.0], [0.3, -1.0, 2.0], [-0.5, 0.2, 0.1]], dtype=torch.float64)
+        augmented = torch.zeros((5, 5), dtype=torch.float64)
+        augmented[:3, :3] = explicit + implicit
+        augmented[:3, 3:] = vectors[1:].flip(0).T
+        augmented[3, 4] = 1
+        context = SimpleNamespace(comm=MPI.COMM_SELF)
+        for method in ("ARK3(2)4L[2]SA", "ARK4(3)6L[2]SA", "ARK4(3)7L[2]SA", "ARK5(4)8L[2]SA", "ARK5(4)8L[2]SAb"):
+            for start in (vectors[0], torch.tensor([1.0, -0.5, 0.25], dtype=torch.float64)):
+                with self.subTest(method=method, start=start.any().item()):
+                    u = vectors.clone()
+                    u[0] = start
+                    initial = torch.cat((start, torch.tensor([0.0, 1.0], dtype=torch.float64)))
+                    expected = (torch.matrix_exp(augmented) @ initial)[:3]
+                    operator = Mock(side_effect=lambda x: (explicit + implicit) @ x)
+                    actual, stats = exode(
+                        1.0, operator, u, method=method, rtol=1e-9, atol=1e-11, context=context, partition=partition
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=1e-7, atol=1e-9)
+                    operator.assert_not_called()
+                    self.assertGreater(stats[2], 0)
+
+    def test_additive_step_is_not_limited_by_implicit_stiffness(self):
+        from wx_factory.solvers.exode import OperatorPartition
+
+        stiff = -1e6
+        partition = OperatorPartition(
+            explicit=lambda x: -x, implicit=lambda x: stiff * x, solve=lambda r, a: r / (1 - a * stiff)
+        )
+        u = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
+        context = SimpleNamespace(comm=MPI.COMM_SELF)
+        actual, stats = exode(
+            1.0, None, u, method="ARK3(2)4L[2]SA", rtol=1e-6, atol=1e-8, context=context, partition=partition
+        )
+        self.assertLess(stats[0], 2000)
+        self.assertLess(actual.abs().item(), 1e-6)
+        with self.assertRaisesRegex(ValueError, "partition"):
+            exode(1.0, lambda x: x, u, method="ARK3(2)4L[2]SA", context=context)
+
+    def test_zero_start_skips_the_operator_at_the_initial_state(self):
+        calls = []
+
+        def operator(x):
+            calls.append(x.clone())
+            return -x
+
+        vectors = torch.tensor([[0.0, 0.0], [1.0, -2.0]], dtype=torch.float64)
+        exode(
+            1.0, operator, vectors, method="BS3(2)", rtol=1e-8, atol=1e-10, context=SimpleNamespace(comm=MPI.COMM_SELF)
+        )
+        self.assertTrue(all(call.any() for call in calls))
+
+    def test_additive_tables_satisfy_coupled_order_conditions(self):
+        from wx_factory.integrators.explicit_runge_kutta import AdditiveRungeKutta
+
+        for name, method in METHODS.items():
+            if not issubclass(method, AdditiveRungeKutta):
+                continue
+            with self.subTest(method=name):
+                c = method.C
+                for weights, order in (
+                    (method.B, method.order),
+                    (method.B + method.E[:-1], method.error_estimator_order),
+                ):
+                    conditions = [weights.sum() - 1, weights @ c - 1 / 2]
+                    if order >= 3:
+                        conditions.append(weights @ c**2 - 1 / 3)
+                        conditions.extend(weights @ table @ c - 1 / 6 for table in (method.A, method.A_implicit))
+                    self.assertLess(max(abs(x) for x in conditions), 1e-12)
+                for table in (method.A, method.A_implicit):
+                    numpy_rows = table.sum(axis=1)
+                    self.assertLess(abs(numpy_rows - c).max(), 1e-12)
+
+    def test_explicit_tables_satisfy_order_conditions_up_to_fourth_order(self):
+        import numpy
+
+        def residuals(A, b, c, order):
+            conditions = [(1, b.sum() - 1), (2, b @ c - 1 / 2), (3, b @ c**2 - 1 / 3), (3, b @ A @ c - 1 / 6)]
+            conditions += [(4, b @ c**3 - 1 / 4), (4, b @ (c * (A @ c)) - 1 / 8), (4, b @ A @ c**2 - 1 / 12)]
+            conditions += [(4, b @ A @ A @ c - 1 / 24)]
+            return [abs(value) for level, value in conditions if level <= order]
+
+        for name, method in METHODS.items():
+            with self.subTest(method=name):
+                s = method.n_stages
+                A = numpy.zeros((s + 1, s + 1))
+                A[:s, : method.A.shape[1]] = method.A
+                A[s, :s] = method.B
+                c = numpy.append(method.C, 1.0)
+                main = numpy.append(method.B, 0.0)
+                embedded = method.E.copy()
+                embedded[:s] += method.B
+                self.assertLess(max(residuals(A, main, c, min(method.order, 4))), 1e-12)
+                self.assertLess(max(residuals(A, embedded, c, min(method.error_estimator_order, 4))), 1e-12)
+
+    def test_every_explicit_pair_solves_phi_actions(self):
+        from wx_factory.integrators.explicit_runge_kutta import AdditiveRungeKutta
+
+        matrix = torch.tensor([[-2.0, 1.0], [-1.0, -0.5]], dtype=torch.float64)
+        u = torch.tensor([[1.0, -2.0], [0.3, 0.1]], dtype=torch.float64)
+        augmented = torch.zeros((3, 3), dtype=torch.float64)
+        augmented[:2, :2] = matrix
+        augmented[:2, 2] = u[1]
+        expected = (torch.matrix_exp(augmented) @ torch.tensor([1.0, -2.0, 1.0], dtype=torch.float64))[:2]
+        for name, method in METHODS.items():
+            if issubclass(method, AdditiveRungeKutta):
+                continue
+            with self.subTest(method=name):
+                actual, _ = exode(
+                    1.0,
+                    lambda x: matrix @ x,
+                    u,
+                    method=name,
+                    rtol=1e-7,
+                    atol=1e-9,
+                    context=SimpleNamespace(comm=MPI.COMM_SELF),
+                )
+                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)

@@ -9,6 +9,8 @@ from ..common.configuration import Configuration
 from ..jacobian import FiniteDifferenceJacobian, fd_jacobian_matvec
 from ..solvers import (
     ExponentialSolverRequest,
+    OperatorPartition,
+    exode_needs_partition,
     resolve_exponential_solver,
 )
 from .integrator import Integrator
@@ -68,6 +70,24 @@ class Epi(Integrator):
 
         self.init_substeps = init_substeps
 
+    def _vertical_partition(self, Q, dt: float):
+        """Split dt*J into the explicit complement and implicit vertical columns."""
+        if self.jac is not None or not hasattr(self.rhs, "linearize_partitions"):
+            raise ValueError(f"EXODE method {self.exode_method} needs the analytic Euler partitions")
+        partitions = self.rhs.linearize_partitions(Q)
+        vertical = partitions.column_operator()
+
+        def solve(value, scale):
+            # The column solver uses I - dt*J1/2, so its time argument is doubled.
+            return vertical.solve(value, 2 * scale * dt).flatten()
+
+        partition = OperatorPartition(
+            explicit=lambda v: dt * partitions.explicit(v),
+            implicit=lambda v: dt * vertical(v),
+            solve=solve,
+        )
+        return partition, partitions.full
+
     def __step__(self, Q: NDArray, dt: float):
 
         # If dt changes, discard saved value and redo initialization
@@ -88,7 +108,10 @@ class Epi(Integrator):
 
         rhs = self.rhs(Q)
         linearization = None
-        if (
+        partition = None
+        if self.exponential_solver == "exode" and exode_needs_partition(self.exode_method):
+            partition, linearization = self._vertical_partition(Q, dt)
+        elif (
             self.jac is None
             and getattr(self.param, "jacobian", "finite_difference") == "analytic"
             and hasattr(self.rhs, "linearize")
@@ -131,6 +154,7 @@ class Epi(Integrator):
                 exode_method=self.exode_method,
                 exode_controller=self.exode_controller,
                 initial_step=lambda: self._initial_exode_step(self.rhs, Q, dt),
+                partition=partition,
             )
         )
         phiv = result.value

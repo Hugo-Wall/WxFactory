@@ -97,15 +97,19 @@ class RungeKutta:
         first_step: float | None = None,
         controller: str | tuple[float, float, float, float] | None = None,
         context: Context | None = None,
+        initial_derivatives: tuple[torch.Tensor, ...] | None = None,
     ):
-        """Use scalar tolerances and a prescribed first step on a forward time interval."""
+        """Use scalar tolerances and a prescribed first step on a forward time interval.
+
+        initial_derivatives supplies partition derivatives at (t0, y0).
+        """
         self._validate_butcher_tableau()
 
         self.comm = context.comm if context is not None else MPI.COMM_WORLD
         self.t = t0
         self._fun, self.y = fun, y0
         self.t_bound = t_bound
-        self._A = torch.as_tensor(self.A, dtype=y0.dtype, device=y0.device)
+        self._tables = tuple(torch.as_tensor(table, dtype=y0.dtype, device=y0.device) for table in self._stage_tables())
         self._B = torch.as_tensor(self.B, dtype=y0.dtype, device=y0.device)
         self._E = torch.as_tensor(self.E, dtype=y0.dtype, device=y0.device)
 
@@ -122,12 +126,12 @@ class RungeKutta:
             raise ValueError("rtol must be finite and nonnegative; atol must be finite and positive")
         self.max_step = max_step
         self.rtol, self.atol = rtol, atol
-        self.f = self.fun(self.t, self.y)
-
-        if self.f.dtype != self.y.dtype:
+        if initial_derivatives is None:
+            initial_derivatives = self._derivatives(self.t, self.y)
+        if any(derivative.dtype != self.y.dtype for derivative in initial_derivatives):
             raise TypeError("dtypes of solution and derivative do not match")
 
-        self.error_exponent = -1 / (self.error_estimator_order + 1)
+        self.error_exponent = -1 / self.error_estimator_order
         self.error_norm_old = None
         self.h_min_a, self.h_min_b = self._init_min_step_parameters()
         self.tiny_err = self.h_min_b
@@ -146,7 +150,10 @@ class RungeKutta:
 
         self.h = first_step
 
-        self.K = y0.new_empty((self.n_stages + 1, self.n))
+        # Row 0 stores the partition derivatives at the accepted solution.
+        self.K = y0.new_empty((len(self._tables), self.n_stages + 1, self.n))
+        for partition, derivative in enumerate(initial_derivatives):
+            self.K[partition, 0] = derivative
         self._step_tensor = y0.new_empty(()) if y0.is_cuda else None
         self._stage_state, self._error_vectors = (
             _compiled_vector_operations() if y0.is_cuda else (_stage_state, _error_vectors)
@@ -158,6 +165,22 @@ class RungeKutta:
     def fun(self, t: float, y):
         self.nfev += 1
         return self._fun(t, y)
+
+    def _stage_tables(self) -> tuple[numpy.ndarray, ...]:
+        return (self.A,)
+
+    def _derivatives(self, t: float, y) -> tuple[torch.Tensor, ...]:
+        return (self.fun(t, y),)
+
+    def _stage_derivatives(self, stage: int, t: float, h: float, value) -> tuple[torch.Tensor, ...]:
+        """Evaluate stage derivatives from the known contribution to the stage."""
+        return self._derivatives(t, value)
+
+    def _combination(self, count: int, weights) -> torch.Tensor:
+        total = self.K[0, :count].T @ weights[0]
+        for partition in range(1, len(weights)):
+            total = torch.addmv(total, self.K[partition, :count].T, weights[partition])
+        return total
 
     def _validate_butcher_tableau(self) -> None:
         for attr in ["n_stages", "order", "error_estimator_order", "A", "B", "C", "E"]:
@@ -300,19 +323,21 @@ class RungeKutta:
             # A device scalar avoids recompilation when adaptivity changes h.
             step = self._step_tensor.fill_(h) if self._step_tensor is not None else h
 
-            self.K[0] = self.f
             for i in range(1, self.n_stages):
-                stage = self._stage_state(y, self.K[:i].T @ self._A[i, :i], step)
-                self.K[i] = self.fun(t + self.C[i] * h, stage)
+                stage = self._stage_state(y, self._combination(i, [table[i, :i] for table in self._tables]), step)
+                for partition, derivative in enumerate(self._stage_derivatives(i, t + self.C[i] * h, h, stage)):
+                    self.K[partition, i] = derivative
 
-            y_new = self._stage_state(y, self.K[: self.n_stages].T @ self._B, step)
+            y_new = self._stage_state(y, self._combination(self.n_stages, [self._B] * len(self._tables)), step)
 
             if self.endpoint_error_stage:
-                self.K[self.n_stages, :] = self.fun(self.t + h, y_new)
+                for partition, derivative in enumerate(self._derivatives(self.t + h, y_new)):
+                    self.K[partition, self.n_stages] = derivative
 
             n_error_stages = self.n_stages + self.endpoint_error_stage
+            error_weights = [self._E[:n_error_stages]] * len(self._tables)
             err_estimate, error_sum_of_squares = self._error_vectors(
-                y, y_new, self.K[:n_error_stages].T @ self._E[:n_error_stages], step, self.rtol, self.atol
+                y, y_new, self._combination(n_error_stages, error_weights), step, self.rtol, self.atol
             )
             error_norm = global_rms_norm(error_sum_of_squares, self.n, self.comm)
 
@@ -335,12 +360,14 @@ class RungeKutta:
 
                 self.failed_steps += 1
 
-        if not self.endpoint_error_stage:
-            self.K[self.n_stages] = self.fun(t_new, y_new)
+        if self.endpoint_error_stage:
+            self.K[:, 0] = self.K[:, self.n_stages]
+        else:
+            for partition, derivative in enumerate(self._derivatives(t_new, y_new)):
+                self.K[partition, 0] = derivative
 
         self.h_previous = h
         self.h = next_step
-        self.f = self.K[self.n_stages].clone()
         self.error_norm_old = error_norm
         self._error_estimate = err_estimate
 
@@ -416,3 +443,53 @@ class RungeKutta:
                 h = d
 
         return h, min_step
+
+
+class AdditiveRungeKutta(RungeKutta):
+    """Embedded ARK pair with a linear implicit partition and shared C, B and E weights.
+
+    A applies to fun; A_implicit applies to implicit_fun.
+    implicit_solve(r, a) solves z - a*implicit_fun(t, z) = r.
+    """
+
+    A_implicit: numpy.ndarray = NotImplemented
+
+    def __init__(
+        self,
+        fun: Callable[[float, torch.Tensor], torch.Tensor],
+        implicit_fun: Callable[[float, torch.Tensor], torch.Tensor],
+        implicit_solve: Callable[[torch.Tensor, float], torch.Tensor],
+        t0: float,
+        y0: torch.Tensor,
+        t_bound: float,
+        **kwargs,
+    ):
+        self._implicit_fun = implicit_fun
+        self._implicit_solve = implicit_solve
+        self.nsolve = 0
+        super().__init__(fun, t0, y0, t_bound, **kwargs)
+
+    def _validate_butcher_tableau(self) -> None:
+        super()._validate_butcher_tableau()
+        shape = (self.n_stages, self.n_stages)
+        if not isinstance(self.A_implicit, numpy.ndarray) or self.A_implicit.shape != shape:
+            raise ValueError(f"A_implicit must be a numpy.ndarray with shape {shape}")
+        if numpy.any(numpy.triu(self.A_implicit, 1)) or self.A_implicit[0, 0] != 0:
+            raise ValueError("A_implicit must be lower triangular with an explicit first stage")
+        if self.E[self.n_stages]:
+            raise ValueError("Additive pairs have no endpoint error stage")
+
+    def _stage_tables(self) -> tuple[numpy.ndarray, ...]:
+        return (self.A, self.A_implicit)
+
+    def _derivatives(self, t: float, y) -> tuple[torch.Tensor, ...]:
+        return (self.fun(t, y), self._implicit_fun(t, y))
+
+    def _stage_derivatives(self, stage: int, t: float, h: float, value) -> tuple[torch.Tensor, ...]:
+        diagonal = self.A_implicit[stage, stage]
+        if not diagonal:
+            return self._derivatives(t, value)
+        self.nsolve += 1
+        solution = self._implicit_solve(value, h * diagonal)
+        # Recover f_I(z) from the stage equation; cancellation grows when z is close to r.
+        return (self.fun(t, solution), (solution - value) / (h * diagonal))

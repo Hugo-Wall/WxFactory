@@ -3,6 +3,7 @@
 import math
 from copy import copy
 
+import numpy
 import torch
 from mpi4py import MPI
 from torch import Tensor
@@ -67,15 +68,15 @@ class RhsEuler:
             for direction in range(3):
                 speed = velocity[direction].abs() + sound * inverse[direction, direction].sqrt()
                 rates[direction] = max(rates[direction], speed.max().item())
-        comm = self.context.comm
-        rates = [comm.allreduce(rate, op=MPI.MAX) for rate in rates]
+        damping = 0.0 if self.damping is None else self.damping[0].max().item()
+        maxima = numpy.array([*rates, damping], dtype=numpy.float64)
+        self.context.comm.Allreduce(MPI.IN_PLACE, maxima, op=MPI.MAX)
         derivative = self.ops.diff_solpt
         correction = self.ops.correction
         extrapolation = torch.stack((self.ops.extrap_west, self.ops.extrap_east))
         # The metric already includes reference-element scaling.
         stencil_norm = (derivative.abs().sum(1) + correction.abs() @ extrapolation.abs().sum(1)).max().item()
-        damping = 0.0 if self.damping is None else comm.allreduce(self.damping[0].max().item(), op=MPI.MAX)
-        return stencil_norm * sum(rates) + damping
+        return float(stencil_norm * maxima[:3].sum() + maxima[3])
 
     def dfr_derivatives(self, action):
         """Cache reference-element stencils independently of the evolving state."""

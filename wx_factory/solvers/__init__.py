@@ -1,6 +1,6 @@
 """Different methods to solve a system of equations."""
 
-from .exode import exode
+from .exode import OperatorPartition, exode, exode_needs_partition
 from .exponential_solver import (
     EXPONENTIAL_SOLVER_REGISTRY,
     ExponentialSolverRequest,
@@ -19,7 +19,9 @@ __all__ = [
     "ExponentialSolverRequest",
     "ExponentialSolverResult",
     "KrylovJacobian",
+    "OperatorPartition",
     "exode",
+    "exode_needs_partition",
     "fgmres",
     "global_dotprod",
     "global_inf_norm",

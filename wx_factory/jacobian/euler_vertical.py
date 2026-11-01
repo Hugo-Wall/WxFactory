@@ -4,10 +4,17 @@ import torch
 
 from ..common.definitions import heat_capacity_ratio
 from ..pde.euler_interfaces import EulerInterfaceGeometry, pressure
-from .block_solve import block_thomas_solve, blocks_matvec, cyclic_block_solve
+from .block_solve import (
+    block_thomas_solve,
+    blocks_matvec,
+    cyclic_block_solve,
+    factor_column_blocks,
+    factor_in_float32,
+)
 from .column_layout import (
     column_dims,
     columns_to_state,
+    coupling_variable_rows,
     scalar_interface_to_columns,
     scalar_to_columns,
     state_interface_to_columns,
@@ -306,7 +313,7 @@ class EulerVerticalLinearization:
         """Solve the selected columns without converting a complete state."""
         columns = columns.clone()
         horizontal = columns.clone()
-        horizontal[..., self.rows] = 0
+        horizontal.index_fill_(-1, self.rows, 0)
         right = columns[..., self.rows] + dt / 2 * blocks_matvec(
             *self.blocks, horizontal, periodic=self.rhs.periodic_vertical
         )
@@ -314,6 +321,73 @@ class EulerVerticalLinearization:
         solve = cyclic_block_solve if self.rhs.periodic_vertical else block_thomas_solve
         columns[..., self.rows] = solve(*stiff, right, dt)
         return columns
+
+
+class EulerColumnLinearization:
+    """Batched column blocks with factors reused at a fixed auxiliary step size."""
+
+    def __init__(self, rhs, state, *, column_batch_size=None):
+        self.rhs, self.state = rhs, state
+        dimensions = column_dims(rhs, state)
+        self.rows = stiff_variable_rows(dimensions.num_solpts, state.device, dimensions.num_var)
+        self.coupling_rows = coupling_variable_rows(dimensions.num_solpts, state.device)
+        if column_batch_size is None:
+            column_batch_size = rhs.config.column_batch_size if state.is_cuda else dimensions.num_columns
+        if column_batch_size < 1:
+            raise ValueError("Column batch size must be positive")
+        self.batches = []
+        for start in range(0, dimensions.num_columns, column_batch_size):
+            selection = slice(start, min(start + column_batch_size, dimensions.num_columns))
+            blocks = EulerVerticalLinearization(rhs, state, columns=selection).blocks
+            stiff = tuple(block[..., self.rows].contiguous() for block in blocks)
+            coupling = tuple(block[..., self.coupling_rows].contiguous() for block in blocks)
+            del blocks
+            self.batches.append((selection, stiff, coupling))
+        self._dt = None
+        self._factors = None
+        self._stiff64 = None
+
+    def __call__(self, vector):
+        columns = state_to_columns(self.rhs, vector.reshape_as(self.state))
+        result = torch.zeros_like(columns)
+        periodic = self.rhs.periodic_vertical
+        for selection, stiff, coupling in self.batches:
+            batch = columns[selection]
+            result[selection, :, self.rows] = blocks_matvec(
+                *stiff, batch[..., self.rows], periodic=periodic
+            ) + blocks_matvec(*coupling, batch[..., self.coupling_rows], periodic=periodic)
+        return columns_to_state(self.rhs, result, self.state).flatten()
+
+    def _factor(self, dt):
+        if self.rhs.periodic_vertical:
+            return [factor_column_blocks(*stiff, dt, periodic=True) for _, stiff, _ in self.batches]
+        if self._stiff64 is None and factor_in_float32(self.batches[0][1][1]):
+            self._stiff64 = [tuple(block.double() for block in stiff) for _, stiff, _ in self.batches]
+        factors = [
+            factor_column_blocks(
+                *stiff, dt, check_errors=False, blocks64=self._stiff64[index] if self._stiff64 else None
+            )
+            for index, (_, stiff, _) in enumerate(self.batches)
+        ]
+        # Combine batch status flags before synchronizing with the host.
+        if torch.stack([factor.failures for factor in factors]).any().item():
+            raise torch.linalg.LinAlgError("Singular block in vertical column factorization")
+        return factors
+
+    def solve(self, vector, dt):
+        if dt != self._dt:
+            self._factors = None
+            self._dt = None
+            self._factors = self._factor(dt)
+            self._dt = dt
+        columns = state_to_columns(self.rhs, vector.reshape_as(self.state)).clone()
+        for (selection, _, coupling), factor in zip(self.batches, self._factors):
+            batch = columns[selection]
+            right = batch[..., self.rows] + dt / 2 * blocks_matvec(
+                *coupling, batch[..., self.coupling_rows], periodic=self.rhs.periodic_vertical
+            )
+            batch[..., self.rows] = factor.solve(right)
+        return columns_to_state(self.rhs, columns, self.state).reshape(self.state.shape)
 
 
 class EulerPartitionLinearization:
@@ -331,6 +405,9 @@ class EulerPartitionLinearization:
 
     def explicit(self, vector):
         return self.full.explicit(vector)
+
+    def column_operator(self, *, column_batch_size=None):
+        return EulerColumnLinearization(self.rhs, self.state, column_batch_size=column_batch_size)
 
     def release_explicit(self):
         """Release exponential-stage caches before assembling implicit blocks."""

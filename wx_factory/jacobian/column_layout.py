@@ -77,6 +77,11 @@ def stiff_variable_rows(num_solpts: int, device, num_var=5):
     )
 
 
+def coupling_variable_rows(num_solpts: int, device):
+    """Horizontal velocity rows coupling into the stiff equations."""
+    return torch.arange((idx_rho + 1) * num_solpts, idx_v3 * num_solpts, device=device)
+
+
 def scalar_to_columns(array, dims: ColumnDims):
     num_elem_z = array.shape[0]
     split = array.reshape(num_elem_z, dims.num_elem_y, dims.num_elem_x, dims.num_solpts, dims.num_solpts_2d)

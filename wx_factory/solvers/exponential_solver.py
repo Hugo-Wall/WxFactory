@@ -6,7 +6,7 @@ from functools import partial
 from typing import Any
 
 from ..context import Context
-from .exode import ExodeStartup, exode
+from .exode import ExodeStartup, OperatorPartition, exode
 from .kiops import kiops
 from .pmex import PmexStartup, pmex
 
@@ -27,6 +27,7 @@ class ExponentialSolverRequest:
     exode_controller: str = "deadbeat"
     announce: bool = True
     initial_step: Callable[[], float] | None = None
+    partition: OperatorPartition | None = None
 
 
 @dataclass(frozen=True)
@@ -138,11 +139,13 @@ def _solve_exode(request: ExponentialSolverRequest, *, startup: ExodeStartup | N
         context=request.context,
         startup=startup,
         initial_step=request.initial_step,
+        partition=request.partition,
     )
     result = ExponentialSolverResult(value, stats[0], stats[1], stats[3], None)
     if request.announce and request.context.comm.rank == 0:
+        solves = f", {stats[2]} implicit solves" if stats[2] else ""
         print(
-            f"EXODE converged after {result.iterations} matrix-vector products "
+            f"EXODE converged after {result.iterations} matrix-vector products{solves} "
             f"with {result.rejected_steps} rejected steps (max local error {result.local_error:.2e})",
             flush=True,
         )
