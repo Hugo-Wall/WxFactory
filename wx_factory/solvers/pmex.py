@@ -2,12 +2,29 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy
 import torch
 from mpi4py import MPI
 from torch import Tensor
 
 from ..context import Context
 from .dense import expm, solve_triangular
+
+
+def _host_allreduce(local: Tensor, comm: MPI.Comm) -> Tensor:
+    """Sum a small array across ranks in host buffers; the copy to the host waits for the producing work."""
+    send = numpy.ascontiguousarray(local.cpu().numpy().reshape(-1))
+    total = numpy.empty_like(send)
+    comm.Allreduce(send, total)
+    return torch.from_numpy(total).reshape(local.shape)
+
+
+def _to_device(values: Tensor, device: torch.device) -> Tensor:
+    """Copy small host coefficients to the device without waiting for queued work."""
+    if device.type != "cuda":
+        return values.to(device)
+    # The caching host allocator keeps the pinned block until the asynchronous copy completes.
+    return values.pin_memory().to(device, non_blocking=True)
 
 
 @dataclass
@@ -93,23 +110,20 @@ def pmex(
     # Keep the large basis in working precision; float64 bookkeeping protects error estimates.
     acc = torch.float64 if u.dtype == torch.float32 else u.dtype
 
-    V = torch.zeros((mmax + 1, n + p), dtype=u.dtype)
-    H = torch.zeros((mmax + 1, mmax + 1), dtype=acc)
-    Minv = torch.eye(mmax, dtype=acc)
-    M = torch.eye(mmax, dtype=acc)
-    N = torch.zeros([mmax, mmax], dtype=acc)
+    # The augmented rows and the Hessenberg bookkeeping are tiny; keeping them on the host avoids
+    # device synchronizations for scalars that the controller reads anyway.
+    device, host = u.device, torch.device("cpu")
+    V = torch.zeros((mmax + 1, n), dtype=u.dtype, device=device)
+    V_aug = torch.zeros((mmax + 1, p), dtype=u.dtype, device=host)
+    H = torch.zeros((mmax + 1, mmax + 1), dtype=acc, device=host)
+    Minv = torch.eye(mmax, dtype=acc, device=host)
+    M = torch.eye(mmax, dtype=acc, device=host)
+    N = torch.zeros([mmax, mmax], dtype=acc, device=host)
 
-    mpi_real = MPI.FLOAT if u.dtype == torch.float32 else MPI.DOUBLE
-    mpi_acc = MPI.DOUBLE if acc == torch.float64 else MPI.FLOAT
-
-    w = torch.zeros((numSteps, n), dtype=u.dtype)
+    w = torch.zeros((numSteps, n), dtype=u.dtype, device=device)
     w[0, :] = u[0, :].clone()
 
-    local_nrmU = torch.sum(abs(u[1:, :]), dim=1)
-    global_normU = torch.empty_like(local_nrmU)
-
-    context.synchronize()
-    comm.Allreduce([local_nrmU, mpi_real], [global_normU, mpi_real])
+    global_normU = _host_allreduce(torch.sum(abs(u[1:, :]), dim=1), comm)
 
     normU = float(torch.amax(global_normU))
 
@@ -153,40 +167,36 @@ def pmex(
         if j == 0:
             H[:, :] = 0.0
 
-            V[0, 0:n] = w[l, :]
+            V[0] = w[l, :]
 
             for k in range(p - 1):
                 i = p - k - 1
-                V[j, n + k] = ((sgn * tau_now) ** i) / math.factorial(i) * mu
-            V[j, n + p - 1] = mu
+                V_aug[j, k] = ((sgn * tau_now) ** i) / math.factorial(i) * mu
+            V_aug[j, p - 1] = mu
 
-            local_sum = torch.sum(V[0, 0:n] * V[0, 0:n], dtype=acc)
-            global_sum_nrm = torch.empty_like(local_sum)
-            context.synchronize()
-            comm.Allreduce([local_sum, mpi_acc], [global_sum_nrm, mpi_acc])
-            beta = math.sqrt(global_sum_nrm + V[j, n : n + p].to(acc) @ V[j, n : n + p].to(acc))
+            global_sum_nrm = _host_allreduce(torch.sum(V[0] * V[0], dtype=acc), comm)
+            beta = math.sqrt(global_sum_nrm + V_aug[j].to(acc) @ V_aug[j].to(acc))
 
-            V[j, :] /= beta
+            V[j] /= beta
+            V_aug[j] /= beta
 
         while j < m:
             j = j + 1
 
-            V[j, 0:n] = A(V[j - 1, 0:n]) + V[j - 1, n : n + p] @ u_flip
-            V[j, n : n + p - 1] = V[j - 1, n + 1 : n + p]
-            V[j, -1] = 0.0
+            augmented = _to_device(V_aug[j - 1], device)
+            V[j] = A(V[j - 1]) + augmented @ u_flip
+            V_aug[j, : p - 1] = V_aug[j - 1, 1:p]
+            V_aug[j, -1] = 0.0
 
             # Two GEMVs avoid a slow two-column float64 GEMM on GPUs.
             if V.is_cuda and V.dtype == torch.float64:
-                basis = V[0 : j + 1, 0:n]
-                local_vec = torch.stack((basis @ V[j - 1, 0:n], basis @ V[j, 0:n]), dim=1).to(acc)
+                basis = V[0 : j + 1]
+                local_vec = torch.stack((basis @ V[j - 1], basis @ V[j]), dim=1).to(acc)
             else:
-                local_vec = (V[0 : j + 1, 0:n] @ V[j - 1 : j + 1, 0:n].T).to(acc)
-            global_vec = torch.empty_like(local_vec)
+                local_vec = (V[0 : j + 1] @ V[j - 1 : j + 1].T).to(acc)
+            global_vec = _host_allreduce(local_vec, comm)
 
-            context.synchronize()
-            comm.Allreduce([local_vec, mpi_acc], [global_vec, mpi_acc])
-
-            global_vec += (V[0 : j + 1, n : n + p] @ V[j - 1 : j + 1, n : n + p].T).to(acc)
+            global_vec += (V_aug[0 : j + 1] @ V_aug[j - 1 : j + 1].T).to(acc)
 
             # Two Gauss-Seidel projections reduce loss of orthogonality.
             if j > 1:
@@ -194,7 +204,8 @@ def pmex(
                 N[0 : j - 1, j - 1] = -global_vec[0 : j - 1, 0]
                 Minv[j - 1, 0 : j - 1] = -global_vec[0 : j - 1, 0] @ Minv[0 : j - 1, 0 : j - 1]
 
-            rhs = (torch.eye(j, dtype=acc) + torch.matmul(N[0:j, 0:j], Minv[0:j, 0:j])) @ global_vec[0:j, 1]
+            correction = torch.eye(j, dtype=acc, device=host) + torch.matmul(N[0:j, 0:j], Minv[0:j, 0:j])
+            rhs = correction @ global_vec[0:j, 1]
 
             if hasattr(torch.linalg, "solve_triangular"):
                 sol = torch.linalg.solve_triangular(
@@ -203,14 +214,13 @@ def pmex(
             else:
                 sol = solve_triangular(M[0:j, 0:j], rhs, lower=True, unit_diagonal=True, check_finite=False)
 
-            V[j, :] -= sol.to(u.dtype) @ V[0:j, :]
+            projection = sol.to(u.dtype)
+            V[j] -= _to_device(projection, device) @ V[0:j]
+            V_aug[j] -= projection @ V_aug[0:j]
 
             # Direct residual norms preserve basis normalization in working precision.
-            local_sum = torch.sum(V[j, 0:n] * V[j, 0:n], dtype=acc)
-            global_sum_nrm = torch.empty_like(local_sum)
-            context.synchronize()
-            comm.Allreduce([local_sum, mpi_acc], [global_sum_nrm, mpi_acc])
-            curr_nrm = math.sqrt(global_sum_nrm + V[j, n : n + p].to(acc) @ V[j, n : n + p].to(acc))
+            global_sum_nrm = _host_allreduce(torch.sum(V[j] * V[j], dtype=acc), comm)
+            curr_nrm = math.sqrt(global_sum_nrm + V_aug[j].to(acc) @ V_aug[j].to(acc))
             reg_comm_nrm += 1
 
             H[0:j, j - 1] = sol
@@ -218,7 +228,8 @@ def pmex(
                 happy = True
                 break
 
-            V[j, :] /= float(curr_nrm)
+            V[j] /= float(curr_nrm)
+            V_aug[j] /= float(curr_nrm)
             H[j, j - 1] = curr_nrm
 
             krystep += 1
@@ -329,11 +340,11 @@ def pmex(
                 for k in range(blownTs):
                     tau_phantom = tau_out[l + k] - tau_now
                     F2 = expm(sgn * tau_phantom * H[0:j, :j])
-                    w[l + k, :] = (beta * F2[:j, 0]).to(u.dtype) @ V[:j, :n]
+                    w[l + k, :] = _to_device((beta * F2[:j, 0]).to(u.dtype), device) @ V[:j]
 
                 l += blownTs
 
-            w[l, :] = (beta * F[:j, 0]).to(u.dtype) @ V[:j, :n]
+            w[l, :] = _to_device((beta * F[:j, 0]).to(u.dtype), device) @ V[:j]
 
             tau_now += tau
 
