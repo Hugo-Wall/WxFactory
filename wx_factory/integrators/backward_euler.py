@@ -20,7 +20,7 @@ class BackwardEuler(Integrator):
 
         maxiter = 100
         if self.preconditioner is not None:
-            self.preconditioner.prepare(dt, Q)
+            self._prepare_preconditioner(Q, 1 / dt, 1)
             maxiter = 800
 
         newQ, _, _ = newton_krylov(

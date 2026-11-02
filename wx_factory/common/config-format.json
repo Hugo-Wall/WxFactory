@@ -624,8 +624,10 @@
                     "type": "str",
                     "default": "none",
                     "selectables": [
-                        "none"
-                    ]
+                        "none",
+                        "element_block_jacobi"
+                    ],
+                    "description": "Preconditioner of the implicit integrators' linear solves. element_block_jacobi inverts the exact element-diagonal Jacobian blocks (shallow water)."
                 },
                 {
                     "name": "verbose_precond",

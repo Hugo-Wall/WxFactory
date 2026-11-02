@@ -56,5 +56,10 @@ class GravityWaveInterface:
             * self.normal_scale
             * (delta_surface * self.normal_velocity + self.depth * delta_normal)
         )
-        delta_energy = (self.contravariant * delta_velocity).sum(dim=0) + gravity * delta_surface
+        # Separate components allow metric coefficients to broadcast across perturbation batches.
+        delta_energy = (
+            self.contravariant[0] * delta_velocity[0]
+            + self.contravariant[1] * delta_velocity[1]
+            + gravity * delta_surface
+        )
         return torch.stack((delta_mass_flux, delta_energy, delta_velocity[0], delta_velocity[1]))

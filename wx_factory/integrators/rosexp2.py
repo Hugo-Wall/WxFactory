@@ -64,6 +64,7 @@ class RosExp2(Integrator):
 
         b = (A(Q_flat) + phiv * dt).flatten()
         Q_x0 = Q_flat.copy()
+        self._prepare_preconditioner(Q, 1.0, dt / 2)
         Qnew, norm_r, norm_b, num_iter, flag, _ = self._solve_linear(
             A,
             b,

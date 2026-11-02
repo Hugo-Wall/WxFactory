@@ -19,7 +19,7 @@ class Integrator(ABC):
        output_manager -- OutputManager object that an Integrator can use. When it is present, the Integrator
                          can output some of its intermediary data that can be useful for analysing performance.
        preconditioner -- Optional object that can be used to precondition a problem. It must provide a "prepare"
-                         and a "__call__" method.
+                         and a "__call__" method; prepare receives the state and system coefficients.
        context         -- Object that describes the execution context (including hardware information)
 
     """
@@ -53,6 +53,11 @@ class Integrator(ABC):
         # Use RK4's stability radius for EXLRK4(3), and a unit startup scale otherwise.
         radius = 2.785293563405282 if self.param.exode_method.upper() == "EXLRK4(3)" else 1.0
         return min(1.0, 0.8 * radius / (dt * rate)) if rate > 0 else 1.0
+
+    def _prepare_preconditioner(self, state, alpha, beta):
+        """Prepare the preconditioner for alpha I - beta J(state)."""
+        if self.preconditioner is not None:
+            self.preconditioner.prepare(state, alpha, beta)
 
     def _solve_linear(self, A, b, x0=None, tol=1e-8, restart=20, maxiter=None):
         return fgmres(
@@ -103,9 +108,6 @@ class Integrator(ABC):
         t0 = time()
 
         self.__prestep__(Q, dt)
-
-        if self.preconditioner is not None:
-            self.preconditioner.prepare(dt, Q)
 
         result = self.__step__(Q, dt)
 

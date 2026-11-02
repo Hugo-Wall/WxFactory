@@ -33,17 +33,22 @@ class RhsShallowWater:
             (0.0, 0.0) if topo is None else (topo.hsurf_itf_i[self.left[0]], topo.hsurf_itf_j[self.left[1]])
         )
 
+    def _face_traces(self, values):
+        """Extrapolate each element to its faces, with zero-initialized halo slots."""
+        layers = values.shape[1:-3]
+        shapes = (self.geom.itf_i_shape, self.geom.itf_j_shape)
+        faces = []
+        for shape, extrapolation, interior in zip(shapes, self.extrapolations, self.interior):
+            face = values.new_zeros((3,) + layers + shape)
+            face[interior] = values @ extrapolation
+            faces.append(face)
+        return faces
+
     def _start_exchange(self, state, *, perturbation=False):
         values = state.clone()
         if not perturbation:
             values[0] += self.bottom
-        layers = state.shape[1:-3]
-        shapes = (self.geom.itf_i_shape, self.geom.itf_j_shape)
-        faces = []
-        for shape, extrapolation, interior in zip(shapes, self.extrapolations, self.interior):
-            face = state.new_zeros((3,) + layers + shape)
-            face[interior] = values @ extrapolation
-            faces.append(face)
+        faces = self._face_traces(values)
         width = self.geom.num_solpts
         i, j = faces
         boundaries = ((j[..., 1, :, :width], j[..., -2, :, width:]), (i[..., 1, :width], i[..., -2, width:]))
@@ -102,14 +107,21 @@ class RhsShallowWater:
     def _volume_derivatives(self, volume_terms):
         return tuple(value @ operator for value, operator in zip(volume_terms, self.derivatives))
 
-    def _add_face_corrections(self, partial, common_values):
+    @staticmethod
+    def _flux_components(common, direction):
+        """Select mass flux, energy and tangential velocity using slices to avoid a GPU index-copy synchronization."""
+        return common[:3] if direction == 1 else torch.cat((common[:2], common[3:]))
+
+    def _add_face_corrections(self, partial, common_values, right_values=None):
+        """Use right_values as separate traces for elements on the right of each face when supplied."""
+        if right_values is None:
+            right_values = common_values
         derivatives = []
-        for direction, (values, common) in enumerate(zip(partial, common_values)):
+        for direction, (values, common, right) in enumerate(zip(partial, common_values, right_values)):
             shape = (3,) + values.shape[1:-3] + (self.geom.itf_i_shape if direction == 0 else self.geom.itf_j_shape)
             trace = values.new_zeros(shape)
-            selected = common[[0, 1, 3 - direction]]
-            trace[self.left[direction]] = selected
-            trace[self.right[direction]] = selected
+            trace[self.left[direction]] = self._flux_components(common, direction)
+            trace[self.right[direction]] = self._flux_components(right, direction)
             derivatives.append(values + trace[self.interior[direction]] @ self.corrections[direction])
         return derivatives
 

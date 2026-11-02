@@ -39,7 +39,7 @@ class Bdf2(Integrator):
                 return (Q_plus - 4.0 / 3.0 * working + 1.0 / 3.0 * self.Qprev) / dt - 2.0 / 3.0 * rhs(Q_plus)
 
             if self.preconditioner is not None:
-                self.preconditioner.prepare(dt, Q, self.Qprev)
+                self._prepare_preconditioner(Q, 1 / dt, 2 / 3)
                 maxiter = 800
             newQ, _, _ = newton_krylov(
                 nonlin_fun,

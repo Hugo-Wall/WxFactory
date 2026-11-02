@@ -75,7 +75,7 @@ Unknown options and options in the wrong section produce a warning, with a spell
    | z1                    | float  | [none]   |                                  |   |
 | | | | | |
  | **[Preconditioning]**  | **Type**  | **Default**  | **Valid range**          | **Description**  |
-   | preconditioner        | lc-str  | none    | {none}                           |   |
+   | preconditioner        | lc-str  | none    | {none, element_block_jacobi}     | Preconditioner of the implicit integrators' linear solves. element_block_jacobi inverts the exact element-diagonal Jacobian blocks (shallow water).  |
    | verbose_precond       | int   | 0         |                                  |   |
 | | | | | |
  | **[Output_options]**  | **Type**  | **Default**  | **Valid range**           | **Description**  |

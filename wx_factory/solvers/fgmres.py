@@ -6,7 +6,7 @@ from torch import Tensor
 
 from ..context import Context
 from .dense import solve_triangular
-from .global_operations import global_allreduce, global_dotprod, global_inf_norm, global_norm
+from .global_operations import global_dotprod, global_inf_norm, global_norm, host_allreduce, to_device
 
 __all__ = ["fgmres"]
 
@@ -22,9 +22,9 @@ def _ortho_1_sync_igs(Q: Tensor, R: Tensor, T: Tensor, K: Tensor, j: int, contex
 
     :param Q: The matrix to orthogonalize. We assume that the first (j-1) columns (or is it j-2?) of that matrix
               are already orthonormal
-    :param R: Data from previous iterations of the orthonormalization process (?)
-    :param T: Data from previous iterations of the orthonormalization process (?)
-    :param K: Data from previous iterations of the orthonormalization process (?)
+    :param R: Host inner products and normalization coefficients for lagged orthogonalization
+    :param T: Host projection coefficients used to form the Gram-Schmidt correction
+    :param K: Host auxiliary coefficients for the lagged Gram-Schmidt recurrence
     :param j: Current number of vectors in the Kyrlov space. We orthogonalize the j^th vector (starting from 1)
               with the previous ones.
               _The matrices may be larger than that, so we can't rely on *.shape_
@@ -46,8 +46,8 @@ def _ortho_1_sync_igs(Q: Tensor, R: Tensor, T: Tensor, K: Tensor, j: int, contex
             basis = Q[:j, start : start + chunk_size].to(acc)
             local_tmp += basis @ basis[j - 2 : j].T
 
-    context.synchronize()
-    global_tmp = global_allreduce(local_tmp, context)
+    # Transfer the Gram matrix once; subsequent scalar calculations use host data.
+    global_tmp = host_allreduce(local_tmp, context.comm)
     small_tmp = global_tmp[: j - 2, 0]
 
     R[: j - 1, j - 1] = global_tmp[: j - 1, 1]
@@ -62,14 +62,14 @@ def _ortho_1_sync_igs(Q: Tensor, R: Tensor, T: Tensor, K: Tensor, j: int, contex
 
     if j > 2:
         L = torch.tril(T[: j - 2, : j - 2].T, -1)
-        L_plus = L + torch.eye(j - 2, dtype=acc)
+        L_plus = L + torch.eye(j - 2, dtype=acc, device=R.device)
         r3 = torch.linalg.solve(L_plus, small_tmp)
 
         R[: j - 2, j - 2] = K[: j - 2, j - 3] + r3
         K[: j - 1, j - 2] = (R[: j - 1, j - 1] - (R[: j - 1, 1 : j - 1] @ r3)) / norm
 
-        Q[j - 2, :] -= Q[: j - 2, :].T @ small_tmp.to(qd)
-        Q[j - 1, :] -= Q[: j - 2, :].T @ R[: j - 2, j - 1].to(qd)
+        Q[j - 2, :] -= Q[: j - 2, :].T @ to_device(small_tmp.to(qd), Q.device)
+        Q[j - 1, :] -= Q[: j - 2, :].T @ to_device(R[: j - 2, j - 1].to(qd), Q.device)
 
     else:
         K[: j - 1, j - 2] = R[: j - 1, j - 1] / norm
@@ -161,7 +161,7 @@ def fgmres(
     else:
         x = x0.clone()
 
-    norm_b = global_norm(b, context=context)
+    norm_b = float(global_norm(b, context=context))
     if norm_b == 0.0:
         return torch.zeros_like(b), 0.0, 0.0, 0, 0, [(0.0, time() - t_start, 0.0)]
 
@@ -178,20 +178,22 @@ def fgmres(
             Ax0 = A(x)
 
     r = b - Ax0
-    norm_r = global_norm(r, context=context)
+    norm_r = float(global_norm(r, context=context))
 
-    residuals.append(((norm_r / norm_b).item(), time() - t_start, 0.0))
+    residuals.append((norm_r / norm_b, time() - t_start, 0.0))
 
     # Keep the large basis in working precision; float64 bookkeeping protects orthogonality.
     dtype = b.dtype if krylov_dtype is None else krylov_dtype
     acc_dtype = torch.float64 if "float32" in str(dtype) else dtype
 
+    # Host bookkeeping avoids GPU synchronization when inspecting scalar coefficients.
+    host = torch.device("cpu")
     for outer in range(maxiter):
         # NOTE: We are dealing with row-major matrices, but we store the transpose of H and V.
-        H = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype)
-        R = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype)
-        T = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype)
-        K = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype)
+        H = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype, device=host)
+        R = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype, device=host)
+        T = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype, device=host)
+        K = torch.zeros((restart + 2, restart + 2), dtype=acc_dtype, device=host)
         V = torch.zeros((restart + 2, num_dofs), dtype=dtype)
         Z = torch.zeros((restart + 1, num_dofs), dtype=dtype)
         Q = []
@@ -201,7 +203,7 @@ def fgmres(
         V[1, :] = A(Z[0, :])
         v_norm = _ortho_1_sync_igs(V, R, T, K, 2, context)
 
-        g = torch.zeros(num_dofs, dtype=acc_dtype)
+        g = torch.zeros(restart + 2, dtype=acc_dtype, device=host)
         g[0] = norm_r
         for inner in range(restart):
             niter += 1
@@ -220,7 +222,7 @@ def fgmres(
             if inner != num_dofs - 1 and H[inner, inner + 1] != 0:
                 [c, s, r] = rotg(float(H[inner, inner]), float(H[inner, inner + 1]))
 
-                Qblock = torch.tensor([[c, s], [-s.conjugate(), c]], dtype=acc_dtype)
+                Qblock = torch.tensor([[c, s], [-s.conjugate(), c]], dtype=acc_dtype, device=host)
                 Q.append(Qblock)
 
                 g[inner : inner + 2] = Qblock @ g[inner : inner + 2]
@@ -231,21 +233,21 @@ def fgmres(
             # Don't update norm_r if last inner iteration, because
             # norm_r is calculated directly after this loop ends.
             if inner < restart - 1:
-                norm_r = torch.abs(g[inner + 1])
-                residuals.append(((norm_r / norm_b).item(), time() - t_start, 0.0))
+                norm_r = abs(float(g[inner + 1]))
+                residuals.append((norm_r / norm_b, time() - t_start, 0.0))
                 if verbose > 1 and comm.rank == 0:
                     print(f"{prefix}norm_r / b = {residuals[-1][0]:.3e}", flush=True)
                 if norm_r < tol_relative:
                     break
 
         y = solve_triangular(H[0 : inner + 1, 0 : inner + 1].T, g[0 : inner + 1])
-        update = torch.ravel(Z[: inner + 1, :].T @ y.astype(Z.dtype).reshape(-1, 1))
+        update = torch.ravel(Z[: inner + 1, :].T @ to_device(y.to(Z.dtype).reshape(-1, 1), Z.device))
         x = x + update
         r = b - A(x)
 
-        norm_r = global_norm(r, context=context)
+        norm_r = float(global_norm(r, context=context))
 
-        residuals.append(((norm_r / norm_b).item(), time() - t_start, 0.0))
+        residuals.append((norm_r / norm_b, time() - t_start, 0.0))
         if verbose > 0 and comm.rank == 0:
             print(f"{prefix}res: {norm_r / norm_b:.2e} (iter {niter})", flush=True)
 
@@ -254,17 +256,17 @@ def fgmres(
         local_change = torch.max(torch.abs(update[indices] / x[indices])) if indices.any() else x.new_tensor(0.0)
         change = global_inf_norm(local_change, comm=comm)
         if change < 1e-12:
-            return x, norm_r.item(), norm_b.item(), niter, -1, residuals
+            return x, norm_r, norm_b, niter, -1, residuals
 
         if norm_r < tol_relative:
-            return x, norm_r.item(), norm_b.item(), niter, 0, residuals
+            return x, norm_r, norm_b, niter, 0, residuals
 
         del V, Z
 
     flag = 0
     if norm_r >= tol_relative:
         flag = -1
-    return x, norm_r.item(), norm_b.item(), niter, flag, residuals
+    return x, norm_r, norm_b, niter, flag, residuals
 
 
 def _apply_givens(Q, v, k):

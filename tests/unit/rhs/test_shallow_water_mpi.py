@@ -58,6 +58,42 @@ class ShallowWaterRhsTestCase(MpiTestCase):
             left, right = face[self.rhs.left[direction]], face[self.rhs.right[direction]]
             torch.testing.assert_close(left, right, rtol=2e-12, atol=2e-9)
 
+    def test_element_blocks_match_the_jacobian_and_block_jacobi_inverts_them(self):
+        from wx_factory.precondition import ElementBlockJacobi
+
+        state = self.sim.Q.clone()
+        linearization = self.rhs.linearize(state)
+        generator = torch.Generator().manual_seed(29 + self.comm.rank)
+        for owner in range(self.comm.size):
+            for element in ((0, 0), (1, 2), (2, 2)):
+                perturbation = torch.zeros_like(state)
+                values = torch.randn(
+                    perturbation[:, element[0], element[1]].shape, generator=generator, dtype=state.dtype
+                )
+                if self.comm.rank == owner:
+                    perturbation[:, element[0], element[1]] = values * state[:, element[0], element[1]].abs().amax(
+                        -1, True
+                    )
+                full = linearization(perturbation).reshape_as(state)
+                local = linearization.element_action(perturbation).reshape_as(state)
+                if self.comm.rank == owner:
+                    torch.testing.assert_close(local[:, element[0], element[1]], full[:, element[0], element[1]])
+                local[:, element[0], element[1]] = 0
+                self.assertEqual(local.abs().max().item(), 0.0)
+
+        directions = torch.randn((3, 2) + state.shape[1:], generator=generator, dtype=state.dtype)
+        batched = linearization.element_action(directions)
+        for column in range(2):
+            torch.testing.assert_close(batched[:, column], linearization.element_action(directions[:, column]))
+
+        preconditioner = ElementBlockJacobi(self.rhs, state.dtype, state.shape, self.sim.config)
+        alpha, beta = 2.0, 300.0
+        preconditioner.prepare(state, alpha, beta)
+        forcing = torch.randn(state.numel(), generator=generator, dtype=state.dtype)
+        solution = preconditioner(forcing)
+        residual = alpha * solution - beta * linearization.element_action(solution) - forcing
+        self.assertLess(residual.abs().max().item(), 1e-10 * forcing.abs().max().item())
+
     def test_full_jacobian_and_mass_conservation(self):
         state = self.sim.Q.clone()
         geometry = self.geometry

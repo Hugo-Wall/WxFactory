@@ -112,7 +112,8 @@ def newton_krylov(
         if terminated:
             break
 
-        tol = min(eta, eta * float(Fx_norm))
+        # Scale the absolute Newton target to FGMRES's relative tolerance to avoid oversolving.
+        tol = min(max(eta, 0.5 * f_tol / float(Fx_norm)), eta_max)
         dx = -linearization.solve(Fx, tol=tol)
 
         if line_search:
@@ -141,7 +142,7 @@ def newton_krylov(
     else:
         raise RuntimeError("Newton–Krylov did not converge within the maximum number of iterations")
 
-    if terminated:
+    if terminated and context.comm.rank == 0:
         print(f"A solution was found after {iteration - 1} steps of the JFNK method.")
 
     return x.reshape(x0.shape), iteration - 1, residuals

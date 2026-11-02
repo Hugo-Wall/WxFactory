@@ -224,12 +224,13 @@ each registers a *provider* that returns a hook instance when it applies or `Non
 ### Add a new preconditioner
 
 Preconditioners are selected by the `preconditioner` config option and registered in
-`wx_factory/precondition/`. There are currently no built-in preconditioners (the historical ones
-were removed because they were broken); `preconditioner = none` means no preconditioning.
+`wx_factory/precondition/`. The built-in `element_block_jacobi` (shallow water) is a working example;
+`preconditioner = none` means no preconditioning.
 
 1. Add a class that subclasses `Preconditioner` (from `wx_factory/precondition/preconditioner.py`).
-   Implement `__apply__(vec, x0, verbose)` (how it acts on a vector), and override `prepare(dt, Q)`
-   if it needs to refresh internal state at the start of each time step.
+   Implement `__apply__(vec, x0, verbose)` (how it acts on a vector), and override
+   `prepare(state, alpha, beta)` if it depends on the system: integrators call it before solving
+   `alpha I - beta J(state)`, e.g. `(1/dt, 1/2)` for Crank-Nicolson and `(1, dt/2)` for ROS2.
 2. Register a factory for its config name:
    ```python
    @register_preconditioner("my_precond")
@@ -239,5 +240,6 @@ were removed because they were broken); `preconditioner = none` means no precond
    `ctx` (a `PreconditionerContext`) carries the config, execution context, geometry, operators, the RHS
    bundle, metric, topography, process topology, and the state-vector shape.
 3. Add `"my_precond"` to the `preconditioner` option's `selectables` in `wx_factory/common/config-format.json`
-   and regenerate the config type hints. Linear-solver-based integrators will then receive it
-   through `self.preconditioner` and call `prepare` / apply it automatically.
+   and regenerate the config type hints, and import the module in `wx_factory/precondition/__init__.py`.
+   Linear-solver-based integrators will then receive it through `self.preconditioner` and call
+   `prepare` / apply it automatically.

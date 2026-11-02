@@ -10,17 +10,16 @@ from ..jacobian import LinearOperator
 class Preconditioner(LinearOperator, ABC):
     """Describes a matrix-like object that can be used to precondition a linear system.
 
-    A concrete preconditioner implements ``__apply__`` (how it acts on a vector) and, if it needs
-    to update internal state at the start of each time step, overrides ``prepare``. Integrators call
-    ``prepare`` uniformly, so no per-type dispatch is needed. See ``doc/contribute.md`` for the
-    recipe to add one via the preconditioner registry."""
+    Implement ``__apply__`` for the inverse action and override ``prepare(state, alpha, beta)``
+    for state-dependent systems ``alpha I - beta J(state)``. See ``doc/contribute.md`` for registration.
+    """
 
     def __init__(self, dtype, shape: tuple, param: Configuration) -> None:
         super().__init__(self.apply, dtype, shape)
         self.verbose = param.verbose_precond if MPI.COMM_WORLD.rank == 0 else 0
 
-    def prepare(self, dt: float, Q: Tensor) -> None:
-        """Update per-time-step internal state before the step's linear solves. Default: no-op."""
+    def prepare(self, state: Tensor, alpha: float, beta: float) -> None:
+        """Prepare state-dependent data for ``alpha I - beta J(state)``."""
 
     def __call__(self, vec: Tensor, x0: Tensor | None = None, verbose: int | None = None) -> Tensor:
         return self.apply(vec, x0, verbose)

@@ -25,7 +25,7 @@ class SDIRKLstable(Integrator):
 
         maxiter = 100
         if self.preconditioner is not None:
-            self.preconditioner.prepare(dt, Q)
+            self._prepare_preconditioner(Q, 1 / dt, self.sdirkparam)
             maxiter = 800
 
         Q1, _, _ = newton_krylov(

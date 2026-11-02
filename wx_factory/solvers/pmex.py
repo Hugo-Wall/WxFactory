@@ -2,29 +2,13 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import numpy
 import torch
 from mpi4py import MPI
 from torch import Tensor
 
 from ..context import Context
 from .dense import expm, solve_triangular
-
-
-def _host_allreduce(local: Tensor, comm: MPI.Comm) -> Tensor:
-    """Sum a small array across ranks in host buffers; the copy to the host waits for the producing work."""
-    send = numpy.ascontiguousarray(local.cpu().numpy().reshape(-1))
-    total = numpy.empty_like(send)
-    comm.Allreduce(send, total)
-    return torch.from_numpy(total).reshape(local.shape)
-
-
-def _to_device(values: Tensor, device: torch.device) -> Tensor:
-    """Copy small host coefficients to the device without waiting for queued work."""
-    if device.type != "cuda":
-        return values.to(device)
-    # The caching host allocator keeps the pinned block until the asynchronous copy completes.
-    return values.pin_memory().to(device, non_blocking=True)
+from .global_operations import host_allreduce, to_device
 
 
 @dataclass
@@ -123,7 +107,7 @@ def pmex(
     w = torch.zeros((numSteps, n), dtype=u.dtype, device=device)
     w[0, :] = u[0, :].clone()
 
-    global_normU = _host_allreduce(torch.sum(abs(u[1:, :]), dim=1), comm)
+    global_normU = host_allreduce(torch.sum(abs(u[1:, :]), dim=1), comm)
 
     normU = float(torch.amax(global_normU))
 
@@ -174,7 +158,7 @@ def pmex(
                 V_aug[j, k] = ((sgn * tau_now) ** i) / math.factorial(i) * mu
             V_aug[j, p - 1] = mu
 
-            global_sum_nrm = _host_allreduce(torch.sum(V[0] * V[0], dtype=acc), comm)
+            global_sum_nrm = host_allreduce(torch.sum(V[0] * V[0], dtype=acc), comm)
             beta = math.sqrt(global_sum_nrm + V_aug[j].to(acc) @ V_aug[j].to(acc))
 
             V[j] /= beta
@@ -183,7 +167,7 @@ def pmex(
         while j < m:
             j = j + 1
 
-            augmented = _to_device(V_aug[j - 1], device)
+            augmented = to_device(V_aug[j - 1], device)
             V[j] = A(V[j - 1]) + augmented @ u_flip
             V_aug[j, : p - 1] = V_aug[j - 1, 1:p]
             V_aug[j, -1] = 0.0
@@ -194,7 +178,7 @@ def pmex(
                 local_vec = torch.stack((basis @ V[j - 1], basis @ V[j]), dim=1).to(acc)
             else:
                 local_vec = (V[0 : j + 1] @ V[j - 1 : j + 1].T).to(acc)
-            global_vec = _host_allreduce(local_vec, comm)
+            global_vec = host_allreduce(local_vec, comm)
 
             global_vec += (V_aug[0 : j + 1] @ V_aug[j - 1 : j + 1].T).to(acc)
 
@@ -215,11 +199,11 @@ def pmex(
                 sol = solve_triangular(M[0:j, 0:j], rhs, lower=True, unit_diagonal=True, check_finite=False)
 
             projection = sol.to(u.dtype)
-            V[j] -= _to_device(projection, device) @ V[0:j]
+            V[j] -= to_device(projection, device) @ V[0:j]
             V_aug[j] -= projection @ V_aug[0:j]
 
             # Direct residual norms preserve basis normalization in working precision.
-            global_sum_nrm = _host_allreduce(torch.sum(V[j] * V[j], dtype=acc), comm)
+            global_sum_nrm = host_allreduce(torch.sum(V[j] * V[j], dtype=acc), comm)
             curr_nrm = math.sqrt(global_sum_nrm + V_aug[j].to(acc) @ V_aug[j].to(acc))
             reg_comm_nrm += 1
 
@@ -340,11 +324,11 @@ def pmex(
                 for k in range(blownTs):
                     tau_phantom = tau_out[l + k] - tau_now
                     F2 = expm(sgn * tau_phantom * H[0:j, :j])
-                    w[l + k, :] = _to_device((beta * F2[:j, 0]).to(u.dtype), device) @ V[:j]
+                    w[l + k, :] = to_device((beta * F2[:j, 0]).to(u.dtype), device) @ V[:j]
 
                 l += blownTs
 
-            w[l, :] = _to_device((beta * F[:j, 0]).to(u.dtype), device) @ V[:j]
+            w[l, :] = to_device((beta * F[:j, 0]).to(u.dtype), device) @ V[:j]
 
             tau_now += tau
 

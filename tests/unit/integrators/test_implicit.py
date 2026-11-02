@@ -10,6 +10,7 @@ from wx_factory.context import Context
 from wx_factory.integrators.backward_euler import BackwardEuler
 from wx_factory.integrators.bdf2 import Bdf2
 from wx_factory.integrators.crank_nicolson import CrankNicolson
+from wx_factory.integrators.ros2 import Ros2
 from wx_factory.integrators.sdirk import SDIRKLstable
 from wx_factory.solvers.fgmres import fgmres
 from wx_factory.solvers.nonlin import newton_krylov
@@ -148,6 +149,59 @@ class ImplicitIntegratorTestCase(unittest.TestCase):
             integrator.step(self.state, 0.1)
             self.assertGreater(len(calls), 0)
             calls.clear()
+
+    def test_newton_does_not_solve_past_its_tolerance(self):
+        target = torch.linspace(0.5, 2.0, 32, dtype=torch.float64).reshape(4, 8)
+        requests = []
+
+        def recording(operator, rhs, **kwargs):
+            requests.append((kwargs["tol"], rhs.norm().item()))
+            return fgmres(operator, rhs, **kwargs)
+
+        f_tol = 1e-8
+        with patch("wx_factory.solvers.nonlin.fgmres", side_effect=recording):
+            result, _, _ = newton_krylov(
+                lambda state: state.square() - target,
+                torch.ones_like(target),
+                context=self.context,
+                f_tol=f_tol,
+                jacobian=lambda state: lambda vector: 2 * state * vector.reshape_as(state),
+            )
+        torch.testing.assert_close(result, target.sqrt(), rtol=0, atol=1e-8)
+        self.assertGreater(len(requests), 2)
+        for tol, residual in requests:
+            self.assertGreaterEqual(tol * residual, 0.5 * f_tol * (1 - 1e-12))
+
+    def test_integrators_prepare_the_preconditioner_for_their_system(self):
+        matrix = self.matrix
+        prepared = []
+
+        class Recorder:
+            def prepare(self, state, alpha, beta):
+                prepared.append((alpha, beta))
+
+            def __call__(self, vector, x0=None, verbose=None):
+                return vector
+
+        dt = 0.1
+        gamma = 1 + 1 / 2**0.5
+        for method, coefficients in (
+            (BackwardEuler, (1 / dt, 1)),
+            (CrankNicolson, (1 / dt, 0.5)),
+            (SDIRKLstable, (1 / dt, gamma)),
+            (Ros2, (1.0, dt / 2)),
+        ):
+            with self.subTest(method=method.__name__):
+                prepared.clear()
+                integrator = method(
+                    self.config, lambda state: matrix @ state, preconditioner=Recorder(), context=self.context
+                )
+                integrator.step(self.state.clone(), dt)
+                self.assertEqual(prepared, [coefficients])
+        prepared.clear()
+        integrator = Bdf2(self.config, lambda state: matrix @ state, preconditioner=Recorder(), context=self.context)
+        integrator.step(integrator.step(self.state.clone(), dt), dt)
+        self.assertEqual(prepared, [(1 / dt, 2 / 3)])
 
 
 if __name__ == "__main__":

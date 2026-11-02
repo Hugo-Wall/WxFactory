@@ -1,3 +1,4 @@
+from .element_block_jacobi import ElementBlockJacobi
 from .preconditioner import Preconditioner
 from .registry import (
     PRECONDITIONER_REGISTRY,
@@ -8,6 +9,7 @@ from .registry import (
 
 __all__ = [
     "PRECONDITIONER_REGISTRY",
+    "ElementBlockJacobi",
     "Preconditioner",
     "PreconditionerContext",
     "register_preconditioner",

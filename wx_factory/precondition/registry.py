@@ -5,8 +5,8 @@ available preconditioner registers a factory in ``PRECONDITIONER_REGISTRY`` and 
 :func:`resolve_preconditioner`, so adding one means adding a class and a ``@register_preconditioner``
 line -- no change to the simulation setup code.
 
-There are currently no built-in preconditioners: the historical ones were removed because they were
-broken. ``preconditioner = none`` (the default) means "no preconditioning" and resolves to ``None``.
+The built-in ``element_block_jacobi`` preconditioner serves the implicit shallow-water integrators.
+``preconditioner = none`` (the default) means "no preconditioning" and resolves to ``None``.
 See ``doc/contribute.md`` for how to add one.
 """
 

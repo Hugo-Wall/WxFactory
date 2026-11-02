@@ -12,7 +12,23 @@ from torch import Tensor
 
 from ..context import Context
 
-__all__ = ["global_allreduce", "global_dotprod", "global_inf_norm", "global_norm"]
+__all__ = ["global_allreduce", "global_dotprod", "global_inf_norm", "global_norm", "host_allreduce", "to_device"]
+
+
+def host_allreduce(local: Tensor, comm: MPI.Comm) -> Tensor:
+    """Reduce a small tensor through host buffers and return a host tensor."""
+    send = numpy.ascontiguousarray(local.cpu().numpy().reshape(-1))
+    total = numpy.empty_like(send)
+    comm.Allreduce(send, total)
+    return torch.from_numpy(total).reshape(local.shape)
+
+
+def to_device(values: Tensor, device: torch.device) -> Tensor:
+    """Copy small host coefficients, using a pinned asynchronous transfer on CUDA."""
+    if device.type != "cuda":
+        return values.to(device)
+    # The caching host allocator keeps the pinned block until the asynchronous copy completes.
+    return values.pin_memory().to(device, non_blocking=True)
 
 
 def _to_scalar(value):

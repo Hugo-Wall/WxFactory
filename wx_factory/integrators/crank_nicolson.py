@@ -18,7 +18,7 @@ class CrankNicolson(Integrator):
 
         maxiter = 100
         if self.preconditioner is not None:
-            self.preconditioner.prepare(dt, Q)
+            self._prepare_preconditioner(Q, 1 / dt, 0.5)
             maxiter = 800
 
         newQ, _, _ = newton_krylov(
