@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from ..geometry import CubedSphere3D
 from .dcmip import ExponentialFilterHook
+from .microphysics import MicrophysicsHook
 from .schar_mountain import ScharMountainHook
 from .step_hook import StepHook
 
@@ -38,9 +39,13 @@ StepHookProvider = Callable[["StepHookContext"], StepHook | None]
 STEP_HOOK_REGISTRY: dict[str, tuple[str, StepHookProvider]] = {}
 
 
-def register_step_hook(name: str, phase: str) -> Callable[[StepHookProvider], StepHookProvider]:
+def register_step_hook(
+    name: str, phase: str
+) -> Callable[[StepHookProvider], StepHookProvider]:
     if phase not in _PHASES:
-        raise ValueError(f"Unknown step-hook phase '{phase}'. Expected one of {_PHASES}")
+        raise ValueError(
+            f"Unknown step-hook phase '{phase}'. Expected one of {_PHASES}"
+        )
 
     def decorator(provider: StepHookProvider) -> StepHookProvider:
         if name in STEP_HOOK_REGISTRY:
@@ -51,7 +56,9 @@ def register_step_hook(name: str, phase: str) -> Callable[[StepHookProvider], St
     return decorator
 
 
-def resolve_step_hooks(ctx: StepHookContext, phase: str) -> dict[type[StepHook], StepHook]:
+def resolve_step_hooks(
+    ctx: StepHookContext, phase: str
+) -> dict[type[StepHook], StepHook]:
     hooks: dict[type[StepHook], StepHook] = {}
     for hook_phase, provider in STEP_HOOK_REGISTRY.values():
         if hook_phase != phase:
@@ -72,5 +79,14 @@ def _schar_mountain(ctx: StepHookContext) -> StepHook | None:
 @register_step_hook("exponential_filter", phase=PHASE_STATE)
 def _exponential_filter(ctx: StepHookContext) -> StepHook | None:
     if ctx.config.expfilter_apply:
-        return ExponentialFilterHook(ctx.geometry, ctx.metric, ctx.operators, ctx.config)
+        return ExponentialFilterHook(
+            ctx.geometry, ctx.metric, ctx.operators, ctx.config
+        )
+    return None
+
+
+@register_step_hook("microphysics", phase=PHASE_STATE)
+def _microphysics(ctx: StepHookContext) -> StepHook | None:
+    if False:
+        return Microphysics(ctx.geometry, ctx.operators, ctx.metric, ctx.config)
     return None
