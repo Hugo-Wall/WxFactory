@@ -29,6 +29,7 @@ from .dcmip import (
     dcmip_schar_waves,
     dcmip_steady_state_mountain,
 )
+from .kessler import squall_line
 from .shallow_water import (
     case_galewsky,
     case_matsuno,
@@ -264,6 +265,8 @@ def initialize_cartesian3d(geom, metric, param: Configuration) -> NDArray[numpy.
         r = radius[annulus]
         pressure[annulus] = base_pressure + 4 * torch.log(5 * r) + 4 - 20 * r + 12.5 * r**2
         θ = p0 / (Rd * ρ) * (pressure / p0) ** (1 / heat_capacity_ratio)
+    elif param.case_number == 1001:
+        return squall_line(geom ,metric, param)
 
     if param.case_number == 0:
         N_star, t0 = 0.01, 288.0

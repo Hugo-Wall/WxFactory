@@ -16,6 +16,5 @@ class MicrophysicsHook(step_hook.StepHook):
 
     def process(self, Q: numpy.ndarray, t: float) -> numpy.ndarray:
         dt = self.config.dt
-        state = torch.from_numpy(Q)
-        self.gscp.step(state, dt)
-        return state.numpy()
+        self.gscp.step(Q, dt) # type: ignore
+        return Q
