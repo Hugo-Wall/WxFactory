@@ -13,8 +13,8 @@ from ..common.definitions import (
     idx_rho,
     idx_rho_theta,
 )
-from ..common.matmul import DFRDerivative, apply_op
 from ..common import Configuration
+from ..common.matmul import DFRDerivative, apply_op
 from ..geometry import (
     DFROperators,
     CubedSphere3D,
@@ -73,7 +73,7 @@ class RhsSedimentation:
     ) -> Tensor:
         velqr = self._terminal_velocity(rho, rho_qr)
         radial = field.radial
-        physical_velocity = velqr * radial
+        physical_velocity = -velqr * radial
         contravariant_velocity = field.raise_velocity(
             field.covariant_from_physical(physical_velocity)
         )
@@ -111,15 +111,14 @@ class RhsSedimentation:
 
         face_rho = face[self.idx_rho]
         face_rho_qr = face[self.idx_rho_qr]
-        # TODO: compute normal velocity from covariant velocity?
         face_contravariant_velocity = self._contravariant_velocity(
             face_rho, face_rho_qr, face_field
         )
         lower, upper = interface_slices(2, self.geom.num_solpts)
         common_face_flux = (
-            face_field.volume_jacobian[upper]
-            * face_rho_qr[upper]
-            * face_contravariant_velocity[2][upper]
+            face_field.volume_jacobian[lower]
+            * face_rho_qr[lower]
+            * face_contravariant_velocity[2][lower]
         )
         face_flux = torch.zeros_like(face[1:])
         face_flux[lower], face_flux[upper] = common_face_flux, common_face_flux
