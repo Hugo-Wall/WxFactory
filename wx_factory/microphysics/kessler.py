@@ -124,7 +124,7 @@ class RhsSedimentation:
         face_flux[lower], face_flux[upper] = common_face_flux, common_face_flux
 
         result = torch.zeros_like(augmented)
-        result[self.idx_rho_qr] -= (
+        result[self.idx_rho_qr:] -= (
             apply_op(volume_flux, self.ops.derivative_z)
             + apply_op(face_flux[self.mid_faces[2]], self.ops.correction_DU)
         ) / volume_field.volume_jacobian
