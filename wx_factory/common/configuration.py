@@ -130,6 +130,7 @@ class Configuration:
     depth_approx: str
     discretization: str
     dt: float
+    enable_gscp: bool
     enable_schar_mountain: bool
     equations: str
     exode_controller: str
