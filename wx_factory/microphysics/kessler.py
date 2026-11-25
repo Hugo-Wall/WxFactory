@@ -62,10 +62,9 @@ class RhsSedimentation:
         return face
 
     def _terminal_velocity(self, rho: Tensor, rho_qr: Tensor) -> Tensor:
-        qr = rho_qr / rho
-        r = 0.001 * rho
-        rhalf = torch.sqrt(1.123 / r)  # TODO: use actual air density at ground level?
-        velqr = 36.34 * (qr * r) ** 0.1364 * rhalf
+        qrr = torch.clamp(0.001 * rho_qr, min=0.0)
+        rhalf = torch.sqrt(1.123 / rho)  # TODO: use actual air density at ground level?
+        velqr = 36.34 * qrr ** 0.1364 * rhalf
         return velqr
 
     def _contravariant_velocity(
@@ -179,7 +178,7 @@ class KesslerMicrophysics:
 
         for i in range(rainsplit):
             # Sedimentation term using DFR
-            sed = dt0 * self.rhs_sedimentation(torch.stack((rho, rho * qr)))
+            sed = dt0 * self.rhs_sedimentation(torch.stack((rho, rho * qr))) / rho
 
             # Autoconversion and accretion rates following KW eq. 2.13a,b
             qrprod = qc - (qc - dt0 * torch.clamp(0.001 * (qc - 0.001), min=0.0)) / (
@@ -219,15 +218,22 @@ class KesslerMicrophysics:
         rho_theta = state[idx_rho_theta]
 
         rho_inv = 1.0 / rho
-        theta = rho_theta * rho_inv
-        qv = state[self.idx_rho_qv] * rho_inv
-        qc = state[self.idx_rho_qc] * rho_inv
-        qr = state[self.idx_rho_qr] * rho_inv
+        theta_v = rho_theta * rho_inv
+        qv = torch.clamp(state[self.idx_rho_qv] * rho_inv, min=0.0)
+        qc = torch.clamp(state[self.idx_rho_qc] * rho_inv, min=0.0)
+        qr = torch.clamp(state[self.idx_rho_qr] * rho_inv, min=0.0)
         pk = (pressure(rho_theta) / p0) ** (Rd / cpd)
 
+        Rv = 461.52 #TODO: move to definitions.py
+        theta = theta_v / (1.0 + Rd / Rv * qv)
         self._kessler(theta, qv, qc, qr, rho, pk, dt)
+        assert torch.all(theta > 0.0) and not torch.isnan(theta).any(), "Potential temperature must be positive and not NaN"
+        assert torch.all(qv >= 0.0) and not torch.isnan(qv).any(), "Water vapor mixing ratio must be non-negative and not NaN"
+        assert torch.all(qc >= 0.0) and not torch.isnan(qc).any(), "Cloud water mixing ratio must be non-negative and not NaN"
+        assert torch.all(qr >= 0.0) and not torch.isnan(qr).any(), "Rain water mixing ratio must be non-negative and not NaN"
+        theta_v = theta * (1.0 + Rd / Rv * qv)
 
-        state[idx_rho_theta] = rho * theta
+        state[idx_rho_theta] = rho * theta_v
         state[self.idx_rho_qv] = rho * qv
         state[self.idx_rho_qc] = rho * qc
         state[self.idx_rho_qr] = rho * qr
