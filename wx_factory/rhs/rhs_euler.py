@@ -33,6 +33,9 @@ class RhsEuler:
         if config.case_number in (41, 410, 411, 412, 413):
             self.scalar_indices += [5, 6]
             self.log_scalar_indices += [5]
+        elif config.case_number in (1001,):
+            self.scalar_indices += [5, 6, 7]
+            self.log_scalar_indices += [5]
         self.rho_theta_position = self.scalar_indices.index(4)
         # Reuse device indices instead of uploading Python lists on each action.
         self.scalar_index = torch.tensor(self.scalar_indices, dtype=torch.long, device=metric.volume.height.device)

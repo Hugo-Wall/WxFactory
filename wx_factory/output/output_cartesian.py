@@ -41,6 +41,23 @@ class OutputCartesian(OutputManager):
             # Roundoff at the background value must not trigger the over-range color.
             theta = torch.where(torch.abs(theta - background_theta) < 1e-10, background_theta, theta)
             image_field(self.geometry, theta, filename, background_theta - 18.0, background_theta, 19, label="θ (K)")
+        elif self.config.case_number == 1001:
+            def _filename(field):
+                return f"{self.output_dir}/{field}_euler_cartesian_{self.config.case_number}_{step_id:08d}"
+            rho_qv = q_xz[5]
+            rho_qc = q_xz[6]
+            rho_qr = q_xz[7]
+            qv = rho_qv / rho
+            qc = rho_qc / rho
+            qr = rho_qr / rho
+            from ..init.squall_line import squall_line_initial_background_sounding
+            x3_xz = self.geometry.to_single_block(self.geometry.X3)[:, j, :]
+            theta_b, _, _ = squall_line_initial_background_sounding(x3_xz)
+            delta_theta = q_xz[idx_rho_theta] / rho - theta_b
+            image_field(self.geometry, qv, _filename("qv"), 0.0, 0.014, 50, label="qv (kg/kg)")
+            image_field(self.geometry, qc, _filename("qc"), 0.0, float(qc.max()) + 1e-5, 50, label="qc (kg/kg)")
+            image_field(self.geometry, qr, _filename("qr"), 0.0, float(qr.max()) + 1e-5, 50, label="qr (kg/kg)")
+            image_field(self.geometry, delta_theta, _filename("delta_theta"), -6.0, 6.0, 50, label="Δθ (K)", colormap="Greys_r")
         else:
             image_field(self.geometry, theta, filename, float(theta.min()), float(theta.max()), 20)
 
